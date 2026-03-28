@@ -1,202 +1,113 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, font
-from ttkbootstrap import Style
-from tkinter.scrolledtext import ScrolledText
-from PIL import Image, ImageTk
 import os
-import threading
 import tempfile
+import numpy as np
 from pathlib import Path
+import ttkbootstrap as tb
+from ttkbootstrap.scrolled import ScrolledFrame
+from ttkbootstrap.dialogs import Messagebox
 from pydub import AudioSegment
-from pulsar import VideoGenerator 
+import tkinter as tk
 
-class MovieEngineApp:
-    def __init__(self, root, audio_file=None):
-        self.root = root
-        self.root.title("Movie Engine")
-        self.root.geometry("500x950") 
-        self.audio_file = audio_file
-        self.style = Style(theme="darkly")
-        self.images = {} 
-        self.export_path = str(Path.home() / "Downloads")
+# 1. IMPORT YOUR MOVIE UI SCRIPT
+# Assuming your UI script is named movie_ui.py
+from movieengine import MovieEngineApp 
 
-        self.main_frame = ttk.Frame(self.root, padding=20)
-        self.main_frame.pack(fill="both", expand=True)
-
-        ttk.Label(self.main_frame, text="MOVIE ENGINE", font=("Helvetica", 28, "bold")).pack(pady=(0, 20))
-
-        # Asset Rows
-        self.bg_canvas = self.create_asset_row("Background", "#302040")
-        self.sp1_canvas = self.create_asset_row("Speaker 1", "#8a8ad4")
-        self.sp2_canvas = self.create_asset_row("Speaker 2", "#40b0a0")
-
-        self.create_signature_row()
-
-        ttk.Separator(self.main_frame, orient="horizontal").pack(fill="x", pady=15)
-
-        # Buttons
-        btn_frame = ttk.Frame(self.main_frame)
-        btn_frame.pack(pady=10, fill="x")
-
-        self.export_btn = ttk.Button(btn_frame, text="📁 Set Export", bootstyle="secondary", command=self.select_export_folder)
-        self.export_btn.pack(side="left", padx=5, expand=True, fill="x")
-
-        self.gen_button = ttk.Button(btn_frame, text="Generate", bootstyle="info", command=self.generate_action)
-        self.style.configure('Large.TButton', font=("Helvetica", 14, "bold"))
-        self.gen_button.configure(style='Large.TButton')
-        self.gen_button.pack(side="left", padx=5, expand=True, fill="x")
-
-        # Logging
-        ttk.Label(self.main_frame, text="log", font=("Courier", 10)).pack(anchor="w")
-        self.log_box = ScrolledText(self.main_frame, height=8, bg="#cccccc", fg="black", font=("Courier", 10))
-        self.log_box.pack(fill="both", expand=True, pady=5)
+class MediaExplorer(tb.Toplevel): 
+    def __init__(self, master, folder_path):
+        super().__init__(master)
+        self.folder_path = Path(folder_path)
         
-        # Initialization
-        self.log_message(f"Default export: {self.export_path}")
-        if self.audio_file:
-            self.log_message(f"Target Audio: {os.path.basename(self.audio_file)}")
-        
-        # Load Defaults into Previews
-        self.load_default_assets()
+        self.title("Logged Interviews")
+        self.geometry("900x600") # Widened slightly to fit the new button
+        self.attributes('-topmost', True) 
 
-    def create_asset_row(self, label_text, placeholder_color):
-        frame = ttk.Frame(self.main_frame)
-        frame.pack(fill="x", pady=10)
-        left_inner = ttk.Frame(frame)
-        left_inner.pack(side="left")
-        ttk.Label(left_inner, text=label_text, font=("Helvetica", 12)).pack(anchor="w")
-        
-        canvas = tk.Canvas(frame, width=100, height=60, bg=placeholder_color, highlightthickness=0)
-        canvas.pack(side="right")
-        canvas.file_path = None 
-        
-        ttk.Button(left_inner, text="Change image", bootstyle="info", command=lambda c=canvas: self.load_image(c)).pack(anchor="w", pady=5)
-        return canvas
+        header = tb.Label(self, text="Logged Interviews", font=("Helvetica", 22, "bold"), bootstyle="light")
+        header.pack(pady=20)
 
-    def load_image(self, canvas, file_path=None):
-        """Loads image into canvas. If file_path is None, opens dialog."""
-        if not file_path:
-            file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")])
-        
-        if file_path and os.path.exists(file_path):
-            try:
-                canvas.file_path = file_path 
-                img = Image.open(file_path).resize((100, 60), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self.images[canvas] = photo
-                canvas.delete("all")
-                canvas.create_image(0, 0, anchor="nw", image=photo)
-                self.log_message(f"Loaded: {os.path.basename(file_path)}")
-            except Exception as e:
-                self.log_message(f"Failed to load {os.path.basename(file_path)}: {e}")
+        self.list_frame = ScrolledFrame(self, autohide=True)
+        self.list_frame.pack(fill="both", expand=True, padx=25, pady=10)
 
-    def load_default_assets(self):
-        """Attempts to load the default assets into the preview boxes on startup."""
-        defaults = {
-            self.bg_canvas: r"DefaultImages\FreeBackground.jpg",
-            self.sp1_canvas: r"DefaultImages\icon2.png",
-            self.sp2_canvas: r"DefaultImages\icon1.png"
-        }
-        for canvas, path in defaults.items():
-            if os.path.exists(path):
-                self.load_image(canvas, file_path=path)
-            else:
-                self.log_message(f"Notice: Default asset {os.path.basename(path)} not found.")
+        self.load_files()
 
-    def create_signature_row(self):
-        sig_frame = ttk.Frame(self.main_frame)
-        sig_frame.pack(fill="x", pady=10)
-        ttk.Label(sig_frame, text="Signature", font=("Helvetica", 12)).pack(anchor="w")
-        
-        entry_frame = ttk.Frame(sig_frame)
-        entry_frame.pack(fill="x", pady=5)
-        
-        self.sig_entry = ttk.Entry(entry_frame)
-        self.sig_entry.insert(0, "PDA - https://discord.gg/Tvz2eHkxBe")
-        self.sig_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    def load_files(self):
+        for widget in self.list_frame.winfo_children():
+            widget.destroy()
 
-        # Get System Fonts
-        system_fonts = sorted([f for f in font.families() if not f.startswith('@')])
-        
-        self.font_dropdown = ttk.Combobox(entry_frame, values=system_fonts, width=20)
-        
-        # Set default font preference
-        if "Arial" in system_fonts:
-            self.font_dropdown.set("Arial")
-        elif len(system_fonts) > 0:
-            self.font_dropdown.current(0)
-            
-        self.font_dropdown.pack(side="right")
-
-    def select_export_folder(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.export_path = path
-            self.log_message(f"Export set to: {path}")
-
-    def log_message(self, message):
-        self.log_box.insert(tk.END, f"> {message}\n")
-        self.log_box.see(tk.END)
-
-    def generate_action(self):
-        if not self.audio_file or not os.path.exists(self.audio_file):
-            self.log_message("Error: Audio file missing!")
+        if not self.folder_path.exists():
+            tb.Label(self.list_frame, text=f"Folder not found: {self.folder_path}", bootstyle="danger").pack(pady=20)
             return
-        self.gen_button.configure(state="disabled")
-        threading.Thread(target=self._worker, daemon=True).start()
 
-    def _worker(self):
-        left_temp = None
-        right_temp = None
+        files = sorted(self.folder_path.glob("*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True)
+
+        if not files:
+            tb.Label(self.list_frame, text="No MP3 files found.", bootstyle="info").pack(pady=20)
+
+        for mp3_path in files:
+            self.create_file_row(mp3_path)
+
+    # 2. NEW METHOD TO LAUNCH THE MOVIE UI
+    def open_movie_maker(self, audio_path):
+        # Create a new Toplevel window for the Movie Engine
+        movie_window = tk.Toplevel(self)
+        # Pass the audio path to your MovieEngineApp class
+        MovieEngineApp(movie_window, audio_file=str(audio_path))
+
+    def create_file_row(self, file_path):
+        row_container = tb.Frame(self.list_frame)
+        row_container.pack(fill="x", pady=5)
+
+        display_name = (file_path.name[:35] + '..') if len(file_path.name) > 35 else file_path.name
+        tb.Label(row_container, text=display_name, width=40, anchor="w").pack(side="left", padx=10)
+
+        # DELETE BUTTON
+        tb.Button(row_container, text="Delete", bootstyle="danger-outline", width=8,
+                  command=lambda fp=file_path: self.delete_file(fp)).pack(side="right", padx=3)
+        
+        # PLAY BUTTON
+        tb.Button(row_container, text="Play", bootstyle="success", width=8, 
+                  command=lambda fp=file_path: self.process_and_play(fp)).pack(side="right", padx=3)
+
+        # 3. THE NEW "MAKE VIDEO" BUTTON
+        tb.Button(row_container, text="Make Video", bootstyle="info", width=12, 
+                  command=lambda fp=file_path: self.open_movie_maker(fp)).pack(side="right", padx=3)
+
+        tb.Separator(self.list_frame, bootstyle="dark").pack(fill="x", padx=10, pady=2)
+
+    def process_and_play(self, file_path):
         try:
-            self.log_message("Processing audio channels...")
-            audio = AudioSegment.from_file(self.audio_file)
+            audio = AudioSegment.from_mp3(file_path)
+            samples = np.array(audio.get_array_of_samples())
             
-            if audio.channels < 2:
-                left_aud = right_aud = audio
+            if audio.channels > 1:
+                samples = samples.reshape((-1, audio.channels))
+                merged_float = samples.astype(np.float64).mean(axis=1)
+                mono_samples = merged_float.astype(samples.dtype)
             else:
-                mono_channels = audio.split_to_mono()
-                left_aud, right_aud = mono_channels[0], mono_channels[1]
+                mono_samples = samples
 
-            temp_dir = tempfile.gettempdir()
-            left_temp = os.path.join(temp_dir, "sp1_audio.wav")
-            right_temp = os.path.join(temp_dir, "sp2_audio.wav")
-            left_aud.export(left_temp, format="wav")
-            right_aud.export(right_temp, format="wav")
-
-            # Final Assets (using current file_path from canvas or fallback strings)
-            bg = self.bg_canvas.file_path or r"DefaultImages\FreeBackground.jpg"
-            sp1 = self.sp1_canvas.file_path or r"DefaultImages\icon2.png"
-            sp2 = self.sp2_canvas.file_path or r"DefaultImages\icon1.png"
-            glow = r"DefaultImages\blurb.png" 
+            mono_audio = audio._spawn(mono_samples.tobytes(), overrides={
+                'channels': 1,
+                'frame_rate': audio.frame_rate
+            })
             
-            self.log_message("Pulsar Engine started...")
-            engine = VideoGenerator(width=1920, height=1080, target_h=720, fps=15)
+            temp_file = Path(tempfile.gettempdir()) / f"merged_{file_path.name}"
+            mono_audio.export(temp_file, format="mp3")
+            os.startfile(temp_file)
             
-            out = engine.generate(
-                audio1_path=left_temp, 
-                audio2_path=right_temp, 
-                bg_path=bg, 
-                icon1_path=sp2, 
-                icon2_path=sp1, 
-                glow_path=glow, 
-                output_folder=self.export_path, 
-                signature_text=self.sig_entry.get(), 
-                font_name=self.font_dropdown.get()
-            )
-            self.log_message(f"Done! Created: {os.path.basename(out)}")
-
         except Exception as e:
-            self.log_message(f"Error: {str(e)}")
-        finally:
-            for path in [left_temp, right_temp]:
-                if path and os.path.exists(path):
-                    try: os.remove(path)
-                    except: pass
-            self.root.after(0, lambda: self.gen_button.configure(state="normal"))
+            Messagebox.show_error(f"Playback failed: {e}", "Audio Error")
+
+    def delete_file(self, file_path):
+        if Messagebox.yesno(f"Permanently delete {file_path.name}?", "Confirm Deletion") == "Yes":
+            try:
+                file_path.unlink()
+                self.load_files()
+            except Exception as e:
+                Messagebox.show_error(f"Could not delete file: {e}", "File Error")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    # Replace with your actual audio test path
-    app = MovieEngineApp(root, audio_file="test_audio.mp3") 
+    root = tb.Window(themename="darkly")
+    # Update this path to your recordings folder
+    my_path = r"C:\Users\James\Documents\recordings" 
+    app = MediaExplorer(root, my_path)
     root.mainloop()
