@@ -13,7 +13,7 @@ import requests
 import multiprocessing  # Required for PyInstaller + Subprocesses
 import time
 
-telementary = r"https://discord.com/api/webhooks/1487995528942715072/ngLKfZnVRsVDfoLKqer8ne2q3G-m02a6F4rJ9QuV1BMVrk0FZL7zNAGtzZC5J38ICRbA"
+telementary = r""
 video_link = r""
 
 import requests
