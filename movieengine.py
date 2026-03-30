@@ -1,135 +1,15 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, font
-from ttkbootstrap import Style
-from tkinter.scrolledtext import ScrolledText
-from PIL import Image, ImageTk
+import asyncio
 import os
-import threading
-import tempfile
-from pathlib import Path
-from pydub import AudioSegment
 import sys
-import requests
-import multiprocessing  # Required for PyInstaller + Subprocesses
-import time
-
-telementary = r""
-video_link = r""
-
-import requests
-
 import subprocess
-import platform
-import os
+import numpy as np
+import math
+import time
+import multiprocessing
+from playwright.async_api import async_playwright
+from pydub import AudioSegment
+from scipy.ndimage import gaussian_filter1d
 
-def get_video_duration(file_path):
-    # This PowerShell command accesses the Windows Shell metadata for 'Length' (ID 27)
-    # It returns a string like "00:08:42"
-    ps_cmd = (
-        f"$shell = New-Object -ComObject Shell.Application; "
-        f"$folder = $shell.Namespace((Split-Path '{file_path}')); "
-        f"$file = $folder.ParseName((Split-Path '{file_path}' -Leaf)); "
-        f"$folder.GetDetailsOf($file, 27)"
-    )
-    
-    try:
-        output = subprocess.check_output(["powershell", "-Command", ps_cmd], text=True).strip()
-        
-        if not output:
-            return None
-            
-        # Convert HH:MM:SS string to total seconds
-        parts = output.split(':')
-        if len(parts) == 3:
-            h, m, s = map(int, parts)
-            total_seconds = h * 3600 + m * 60 + s
-            return f"{total_seconds}s"
-        return output # Return original string if format is unexpected
-    except Exception:
-        return "Unknown"
-
-
-def get_preinstalled_device_info():
-    info = {}
-
-    # 1. Get CPU Name (Windows specific)
-    try:
-        cpu = subprocess.check_output("wmic cpu get name", shell=True).decode().split('\n')[1].strip()
-        info['cpu'] = cpu
-    except:
-        info['cpu'] = platform.processor()
-
-    # 2. Get GPU Name (Windows specific)
-    try:
-        gpu = subprocess.check_output("wmic path win32_VideoController get name", shell=True).decode().split('\n')[1].strip()
-        info['gpu'] = gpu
-    except:
-        info['gpu'] = "Unknown GPU"
-
-    # 3. Get RAM Capacity (Windows specific, converted to GB)
-    try:
-        ram_bytes = subprocess.check_output("wmic computersystem get totalphysicalmemory", shell=True).decode().split('\n')[1].strip()
-        ram_gb = round(int(ram_bytes) / (1024**3))
-        info['ram'] = f"{ram_gb}GB"
-    except:
-        info['ram'] = "Unknown RAM"
-
-    return info
-
-# Usage with your webhook function
-specs = get_preinstalled_device_info()
-
-# print(specs['cpu']) -> "Intel(R) Core(TM) i7-14700F"
-# print(specs['gpu']) -> "NVIDIA GeForce RTX 4070 Super"
-# print(specs['ram']) -> "32GB"
-
-def send_telemetry_webhook(
-    webhook_url,
-    render_time=None,
-    video_length=None,
-    cpu_model=None,
-    gpu_model=None,
-    ram_capacity=None,
-    video_link=None,
-    output_webhook=None
-):
-    # Mapping your parameters to the Discord field names
-    potential_fields = [
-        ("Render Time elapsed", render_time),
-        ("Video Length", video_length),
-        ("CPU", cpu_model),
-        ("GPU", gpu_model),
-        ("RAM capacity", ram_capacity),
-        ("Video Link (If applicable)", video_link),
-        ("WebHook output (If Applicable)", output_webhook),
-    ]
-
-    # Only add the field if the value is provided
-    fields = [
-        {"name": name, "value": str(value), "inline": True}
-        for name, value in potential_fields if value is not None
-    ]
-
-    payload = {
-        "content": None,
-        "embeds": [
-            {
-                "title": "Video Made",
-                "color": 8723894,  # Your specific green/teal color
-                "fields": fields
-            }
-        ],
-        "attachments": []
-    }
-
-    response = requests.post(webhook_url, json=payload)
-    
-    if response.status_code == 204:
-        print("Webhook sent successfully!")
-    else:
-        print(f"Failed to send webhook: {response.status_code}, {response.text}")
-
-# --- PyInstaller Path Logic ---
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
@@ -137,260 +17,245 @@ def resource_path(relative_path):
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
+
     return os.path.join(base_path, relative_path)
 
-# Point pydub to the bundled ffmpeg if you include it in your project folder
-ffmpeg_bin = resource_path("ffmpeg.exe")
-if os.path.exists(ffmpeg_bin):
-    AudioSegment.converter = ffmpeg_bin
+# --- CRITICAL: Link to your pw-browsers folder ---
+# This ensures Playwright looks in your project folder instead of AppData
+BROWSER_STORAGE = resource_path("pw-browsers")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSER_STORAGE
 
-# Try to import your custom engine; if it's bundled, PyInstaller handles it
-try:
-    from MK1Engine import run_video_generation
-except ImportError:
-    run_video_generation = None
-
-# Resolve default asset paths immediately using resource_path
-DEFAULT_BG = resource_path(os.path.join("DefaultImages", "FreeBackground.jpg"))
-DEFAULT_ICON1 = resource_path(os.path.join("DefaultImages", "icon1.png"))
-DEFAULT_ICON2 = resource_path(os.path.join("DefaultImages", "icon2.png"))
-DEFAULT_GLOW = resource_path(os.path.join("DefaultImages", "blurb.png"))
-APP_ICON = resource_path(os.path.join("DefaultImages", "PDA.ico"))
-
-class MovieEngineApp:
-    def __init__(self, root, audio_file=None):
-        self.root = root
-        self.root.title("Movie Engine")
-        self.root.geometry("500x980")
-        self.audio_file = audio_file
-        self.style = Style(theme="darkly")
-        self.images = {}
-        self.export_path = str(Path.home() / "Downloads")
+class run_video_generation:
+    def __init__(self, width=1920, height=1080, fps=24):
+        self.width = width
+        self.height = height
+        self.fps = fps
         
-        # Set window icon safely
-        if os.path.exists(APP_ICON):
-            try:
-                self.root.iconbitmap(APP_ICON)
-            except Exception:
-                pass 
-
-        self.main_frame = ttk.Frame(self.root, padding=20)
-        self.main_frame.pack(fill="both", expand=True)
-
-        ttk.Label(self.main_frame, text="MOVIE ENGINE", font=("Helvetica", 28, "bold")).pack(pady=(0, 20))
-
-        # Asset Rows
-        self.bg_canvas = self.create_asset_row("Background", "#302040")
-        self.sp1_canvas = self.create_asset_row("Speaker 1", "#8a8ad4")
-        self.sp2_canvas = self.create_asset_row("Speaker 2", "#40b0a0")
-
-        self.create_signature_row()
-        ttk.Separator(self.main_frame, orient="horizontal").pack(fill="x", pady=15)
-
-        # Buttons
-        btn_frame = ttk.Frame(self.main_frame)
-        btn_frame.pack(pady=10, fill="x")
-
-        self.export_btn = ttk.Button(btn_frame, text="📁 Set Export", bootstyle="secondary", command=self.select_export_folder)
-        self.export_btn.pack(side="left", padx=5, expand=True, fill="x")
-
-        self.gen_button = ttk.Button(btn_frame, text="Generate", bootstyle="info", command=self.generate_action)
-        self.style.configure('Large.TButton', font=("Helvetica", 14, "bold"))
-        self.gen_button.configure(style='Large.TButton')
-        self.gen_button.pack(side="left", padx=5, expand=True, fill="x")
-
-        # Discord Webhook
-        webhook_frame = ttk.Frame(self.main_frame)
-        webhook_frame.pack(fill="x", pady=(5, 10))
-        ttk.Label(webhook_frame, text="autoupload to discord webhook", font=("Helvetica", 10)).pack(anchor="w")
-        self.webhook_entry = ttk.Entry(webhook_frame)
-        self.webhook_entry.pack(fill="x", pady=2)
-
-        # Logging
-        ttk.Label(self.main_frame, text="log", font=("Courier", 10)).pack(anchor="w")
-        self.log_box = ScrolledText(self.main_frame, height=8, bg="#cccccc", fg="black", font=("Courier", 10))
-        self.log_box.pack(fill="both", expand=True, pady=5)
+        # Look for ffmpeg.exe in the root of the bundle
+        self.ffmpeg_exe = resource_path("ffmpeg.exe")
         
-        self.log_message(f"Default export: {self.export_path}")
-        if self.audio_file:
-            self.log_message(f"Target Audio: {os.path.basename(self.audio_file)}")
+        total_cores = multiprocessing.cpu_count()
+        self.cores = max(1, int(total_cores * 0.35))
         
-        self.load_default_assets()
-
-    def create_asset_row(self, label_text, placeholder_color):
-        frame = ttk.Frame(self.main_frame)
-        frame.pack(fill="x", pady=10)
-        left_inner = ttk.Frame(frame)
-        left_inner.pack(side="left")
-        ttk.Label(left_inner, text=label_text, font=("Helvetica", 12)).pack(anchor="w")
+        self.codec = self._detect_best_codec()
         
-        canvas = tk.Canvas(frame, width=100, height=60, bg=placeholder_color, highlightthickness=0)
-        canvas.pack(side="right")
-        canvas.file_path = None
-        
-        ttk.Button(left_inner, text="Change image", bootstyle="info", command=lambda c=canvas: self.load_image(c)).pack(anchor="w", pady=5)
-        return canvas
+        print(f"🛠 Hardware Profile: Using {self.cores}/{total_cores} cores")
+        print(f"🚀 Encoder Selected: {self.codec}")
+        print(f"📂 FFmpeg Path: {self.ffmpeg_exe}")
+        print(f"🌐 Expected Browser Storage: {BROWSER_STORAGE}")
 
-    def load_image(self, canvas, file_path=None):
-        if not file_path:
-            file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")])
-        
-        if file_path and os.path.exists(file_path):
-            try:
-                canvas.file_path = file_path
-                img = Image.open(file_path).resize((100, 60), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self.images[canvas] = photo
-                canvas.delete("all")
-                canvas.create_image(0, 0, anchor="nw", image=photo)
-            except Exception as e:
-                self.log_message(f"Load Error: {e}")
-
-    def load_default_assets(self):
-        defaults = {
-            self.bg_canvas: DEFAULT_BG,
-            self.sp1_canvas: DEFAULT_ICON2,
-            self.sp2_canvas: DEFAULT_ICON1
-        }
-        for canvas, path in defaults.items():
-            if os.path.exists(path):
-                self.load_image(canvas, file_path=path)
-            else:
-                self.log_message(f"Missing internal asset: {os.path.basename(path)}")
-
-    def create_signature_row(self):
-        sig_frame = ttk.Frame(self.main_frame)
-        sig_frame.pack(fill="x", pady=10)
-        ttk.Label(sig_frame, text="Signature", font=("Helvetica", 12)).pack(anchor="w")
-        entry_frame = ttk.Frame(sig_frame)
-        entry_frame.pack(fill="x", pady=5)
-        self.sig_entry = ttk.Entry(entry_frame)
-        self.sig_entry.insert(0, "PDA - https://discord.gg/Tvz2eHkxBe")
-        self.sig_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        
-        system_fonts = sorted([f for f in font.families() if not f.startswith('@')])
-        self.font_dropdown = ttk.Combobox(entry_frame, values=system_fonts, width=20)
-        self.font_dropdown.set("Arial" if "Arial" in system_fonts else system_fonts[0] if system_fonts else "")
-        self.font_dropdown.pack(side="right")
-
-    def select_export_folder(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.export_path = path
-            self.log_message(f"Export set to: {path}")
-
-    def log_message(self, message):
-        self.log_box.insert(tk.END, f"> {message}\n")
-        self.log_box.see(tk.END)
-
-    def upload_to_catbox(self, file_path):
+    def _detect_best_codec(self):
         try:
-            url = "https://catbox.moe/user/api.php"
-            video_link = url
-            data = {"reqtype": "fileupload", "userhash": ""}
-            with open(file_path, 'rb') as f:
-                files = {'fileToUpload': f}
-                response = requests.post(url, data=data, files=files)
-            return response.text if response.status_code == 200 else None
-        except Exception as e:
-            self.log_message(f"Upload failed: {e}")
-            return None
+            nv_check = subprocess.run(
+                [self.ffmpeg_exe, "-encoders"], 
+                capture_output=True, 
+                text=True, 
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            if "h264_nvenc" in nv_check.stdout:
+                return "h264_nvenc"
+            if "h264_amf" in nv_check.stdout:
+                return "h264_amf"
+        except Exception:
+            pass
+        return "libx264"
 
-    def send_to_webhook(self, webhook_url, content_url):
-        try:
-            requests.post(webhook_url, json={"content": content_url})
-        except: pass
-
-    def generate_action(self):
-        if not self.audio_file or not os.path.exists(self.audio_file):
-            self.log_message("Error: Audio file missing!")
+    def ensure_playwright_installed(self):
+        print("🔍 Checking browser dependencies...")
+        
+        # Check if the folder exists and isn't empty
+        if os.path.exists(BROWSER_STORAGE) and os.listdir(BROWSER_STORAGE):
+            print(f"✅ Local browsers folder detected.")
             return
-        self.gen_button.configure(state="disabled")
-        threading.Thread(target=self._worker, daemon=True).start()
 
-    def _worker(self):
-        start_time = time.time()
-        left_temp, right_temp = None, None
         try:
-            self.log_message("Splitting audio...")
-            audio = AudioSegment.from_file(self.audio_file)
+            from playwright._impl._driver import compute_driver_executable, get_driver_env
             
-            if audio.channels < 2:
-                left_aud = right_aud = audio
-            else:
-                mono_channels = audio.split_to_mono()
-                left_aud, right_aud = mono_channels[0], mono_channels[1]
-
-            temp_dir = tempfile.gettempdir()
-            left_temp = os.path.join(temp_dir, "sp1_audio.wav")
-            right_temp = os.path.join(temp_dir, "sp2_audio.wav")
-            left_aud.export(left_temp, format="wav")
-            right_aud.export(right_temp, format="wav")
-
-            bg = self.bg_canvas.file_path or DEFAULT_BG
-            sp1 = self.sp1_canvas.file_path or DEFAULT_ICON2
-            sp2 = self.sp2_canvas.file_path or DEFAULT_ICON1
+            env = get_driver_env()
+            env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSER_STORAGE
             
-            if run_video_generation is None:
-                raise ImportError("MK1Engine not found!")
-
-            self.log_message("Pulsar Engine V2 MK1 started...")
-            engine = run_video_generation(width=1920, height=1080, target_h=720, fps=15)
+            driver_executable, driver_cli = compute_driver_executable()
             
-            out_file = engine.generate(
-                audio1_path=left_temp,
-                audio2_path=right_temp,
-                bg_path=bg,
-                icon1_path=sp2,
-                icon2_path=sp1,
-                glow_path=DEFAULT_GLOW,
-                output_folder=self.export_path,
-                signature_text=self.sig_entry.get(),
-                font_name=self.font_dropdown.get()
+            print("📥 Downloading Chromium to local project folder...")
+            subprocess.run(
+                [str(driver_executable), str(driver_cli), "install", "chromium"], 
+                env=env,
+                check=True, 
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            end_time = time.time()
-            self.log_message(f"Created: {os.path.basename(out_file)}")
-            webhook_url = self.webhook_entry.get().strip()
-
-            send_telemetry_webhook(
-                telementary,
-                render_time=f"{end_time - start_time:.2f}s",
-                video_length=f"{get_video_duration(out_file)}",
-                cpu_model=specs['cpu'],
-                gpu_model=specs['gpu'],
-                ram_capacity=specs['ram'],
-                video_link=video_link,
-                output_webhook=webhook_url if webhook_url else None
-            )
-
-
-            
-            if webhook_url:
-                if (os.path.getsize(out_file) / (1024*1024)) > 200:
-                    self.log_message("File too large for Discord (>200MB)")
-                else:
-                    self.log_message("Uploading...")
-                    link = self.upload_to_catbox(out_file)
-                    if link:
-                        self.send_to_webhook(webhook_url, link)
-                        self.log_message("Webhook sent!")
-
+            print("✅ Browser dependencies ready.")
         except Exception as e:
-            self.log_message(f"Error: {e}")
-        finally:
-            for p in [left_temp, right_temp]:
-                if p and os.path.exists(p): os.remove(p)
-            self.root.after(0, lambda: self.gen_button.configure(state="normal"))
+            print(f"⚠️ Playwright check/install failed: {e}")
 
-# --- PROPER ENTRY POINT FOR PYINSTALLER ---
-if __name__ == "__main__":
-    # Required to prevent the EXE from starting multiple GUI instances 
-    # when subprocesses/threading are called.
-    multiprocessing.freeze_support()
-    
-    # Optional: ensure high recursion limit for complex UI/Playwright calls
-    sys.setrecursionlimit(2000)
-    
-    root = tk.Tk()
-    app = MovieEngineApp(root)
-    root.mainloop()
+    # --- Added target_h here as requested ---
+    def generate(self, audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
+                 glow_path, output_folder, signature_text, font_name, target_h=720):
+        
+        self.ensure_playwright_installed()
+        out_name = f"render_{int(time.time())}.mp4"
+        final_output = os.path.join(output_folder, out_name)
+
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+
+        return asyncio.run(self._async_generate(
+            audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
+            final_output, signature_text, font_name, target_h
+        ))
+
+    async def _async_generate(self, a1, a2, bg, i1, i2, out_path, signature, font, target_h):
+        print("📊 Analyzing audio channels...")
+        s2 = AudioSegment.from_file(a1)
+        s1 = AudioSegment.from_file(a2)
+        total_f = int((max(len(s1), len(s2)) / 1000.0) * self.fps)
+        
+        def get_v(seg):
+            ms = 1000 / self.fps
+            v = np.zeros(total_f)
+            limit = min(total_f, int(len(seg)/ms))
+            v[:limit] = [seg[int(i*ms):int((i+1)*ms)].rms for i in range(limit)]
+            if v.max() > 0: v /= v.max()
+            return gaussian_filter1d(v, sigma=1.2)
+
+        v1, v2 = get_v(s1), get_v(s2)
+
+        paths = {
+            'html': resource_path(os.path.join("DefaultImages", "movie.html")),
+            'bg_img': bg,
+            'h_img': i1,
+            'g_img': i2
+        }
+
+        chunk_len = math.ceil(total_f / self.cores)
+        tasks = []
+        for i in range(self.cores):
+            start = i * chunk_len
+            end = min((i+1)*chunk_len, total_f)
+            if start < end:
+                tasks.append(self.render_chunk(
+                    i, start, end, v1, v2, paths, signature, font, target_h
+                ))
+
+        print(f"🔥 Rendering chunks on {len(tasks)} workers...")
+        chunks_data = [None] * len(tasks)
+        for task in asyncio.as_completed(tasks):
+            res = await task
+            if res and res[1]:
+                chunks_data[res[0]] = res[1]
+
+        valid_chunks = [c for c in chunks_data if c is not None]
+        
+        parts_file = f"parts_{int(time.time())}.txt"
+        with open(parts_file, "w", encoding='utf-8') as f:
+            for c in valid_chunks:
+                f.write(f"file '{os.path.abspath(c).replace('\\', '/')}'\n")
+
+        subprocess.run([
+            self.ffmpeg_exe, '-y', '-f', 'concat', '-safe', '0', '-i', parts_file,
+            '-i', a1, '-i', a2,
+            '-filter_complex', '[1:a][2:a]amix=inputs=2:duration=longest[aout]',
+            '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', out_path
+        ], stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+
+        for f in valid_chunks + [parts_file]:
+            if os.path.exists(f): os.remove(f)
+
+        print(f"✅ Video saved to: {out_path}")
+        return out_path
+
+    async def render_chunk(self, chunk_id, start_f, end_f, vol1, vol2, paths, sig_text, font_name, target_h):
+        chunk_name = f"part_{chunk_id}.mp4"
+        SENSITIVITY, MIN_OUTLINE, MAX_OUTLINE = 1.5, 0, 40
+        SCALE_AMOUNT = 0.04
+        range_val = MAX_OUTLINE - MIN_OUTLINE
+
+        # Dynamic Bitrate Calculation (Roughly 4Mbps for 1080p, 2Mbps for 720p, etc.)
+        # This ensures file size drops with resolution.
+        bitrate = f"{int((target_h / 1080) * 4000)}k"
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                
+                if chunk_id == 0:
+                    print(f"🧪 [TEST] Browser Executable: {p.chromium.executable_path}")
+                
+                context = await browser.new_page(viewport={'width': self.width, 'height': self.height})
+                
+                html_url = f"file:///{os.path.abspath(paths['html']).replace('\\', '/')}"
+                await context.goto(html_url)
+
+                bg_p = f"file:///{os.path.abspath(paths['bg_img']).replace('\\', '/')}"
+                h_p = f"file:///{os.path.abspath(paths['h_img']).replace('\\', '/')}"
+                g_p = f"file:///{os.path.abspath(paths['g_img']).replace('\\', '/')}"
+
+                await context.evaluate(f"""() => {{
+                    document.querySelector('.background-img').src = '{bg_p}';
+                    const s = document.querySelectorAll('.speaker');
+                    if(s[0]) s[0].src = '{h_p}';
+                    if(s[1]) s[1].src = '{g_p}';
+                    window.speakers = s;
+                    const sig = document.querySelector('#signature');
+                    if(sig) {{
+                        sig.innerText = "{sig_text}";
+                        sig.style.fontFamily = "{font_name}";
+                    }}
+                }}""")
+
+                await context.add_style_tag(content=f"""
+                    .speaker {{
+                        outline-width: calc({MIN_OUTLINE}px + (var(--pulse, 0) * {SENSITIVITY} * {range_val}px)) !important;
+                        transform: scale(calc(1 + (var(--pulse, 0) * {SCALE_AMOUNT}))) !important;
+                        outline-style: solid !important;
+                        outline-color: rgba(70, 220, 70, clamp(0, (var(--pulse) - 0.02) * 100, 1)) !important;
+                        transition: transform 0.04s linear, outline-width 0.04s linear;
+                    }}
+                """)
+
+                # Base command with scaling
+                cmd = [
+                    self.ffmpeg_exe, '-y', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-r', str(self.fps),
+                    '-i', '-', '-vf', f'scale=-2:{target_h}', '-c:v', self.codec
+                ]
+                
+                # Encoder-specific optimization for file size
+                if "nvenc" in self.codec:
+                    # Use Constant Quantization for NVENC
+                    cmd += ['-rc', 'vbr', '-cq', '28', '-b:v', bitrate, '-maxrate', bitrate, '-preset', 'p1', '-pix_fmt', 'yuv420p']
+                elif "amf" in self.codec:
+                    cmd += ['-b:v', bitrate, '-pix_fmt', 'yuv420p']
+                else:
+                    # Use CRF for libx264 (Lower file size, good quality)
+                    # 23 is default, 28 is smaller/lower quality, 18 is larger/higher quality
+                    cmd += ['-crf', '26', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-b:v', bitrate]
+
+                cmd.append(chunk_name)
+                
+                proc = subprocess.Popen(
+                    cmd, 
+                    stdin=subprocess.PIPE, 
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
+
+                for i in range(start_f, end_f):
+                    v1_val, v2_val = float(vol1[i]), float(vol2[i])
+                    v1_val = v1_val if v1_val > 0.005 else 0
+                    v2_val = v2_val if v2_val > 0.005 else 0
+
+                    await context.evaluate(f"""() => {{
+                        if(window.speakers[0]) window.speakers[0].style.setProperty('--pulse', {v1_val});
+                        if(window.speakers[1]) window.speakers[1].style.setProperty('--pulse', {v2_val});
+                    }}""")
+                    
+                    frame = await context.screenshot(type='jpeg', quality=85)
+                    proc.stdin.write(frame)
+
+                proc.stdin.close()
+                proc.wait()
+                await browser.close()
+                return chunk_id, chunk_name
+        except Exception as e:
+            print(f"Worker {chunk_id} error: {e}")
+            return chunk_id, None
