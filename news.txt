@@ -1,3 +1,5 @@
 New Version is out now 1.0.2 - please update for new features if you haven't already - Beta - You can find updates on GitHub - https://github.com/Lixvinity/InterviewRecorder and on our Discord - https://discord.gg/Tvz2eHkxBe
 
 you can help support the project by donating https://github.com/sponsors/Lixvinity
+
+we are aware of rendering issues for older hardware and working on a fix
