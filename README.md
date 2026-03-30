@@ -1,7 +1,8 @@
 # InterviewRecorder
 **Record and analyize interviews and debates!**
 
-<img width="1727" height="1013" alt="preview" src="https://github.com/user-attachments/assets/e88edcaa-e6de-43d6-8047-1e1c7825c098" />
+<img width="1727" height="1013" alt="preview" src="https://github.com/user-attachments/assets/c49f2237-42ce-42c7-8b9d-18135b1f732d" />
+
 
 **- Prep audio for transcriptions
 - Analyze and archive interviews
