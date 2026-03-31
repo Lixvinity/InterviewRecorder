@@ -6,6 +6,7 @@ import numpy as np
 import math
 import time
 import multiprocessing
+import psutil  # Added for RAM detection
 from playwright.async_api import async_playwright
 from pydub import AudioSegment
 from scipy.ndimage import gaussian_filter1d
@@ -13,36 +14,53 @@ from scipy.ndimage import gaussian_filter1d
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
-
     return os.path.join(base_path, relative_path)
 
-# --- CRITICAL: Link to your pw-browsers folder ---
-# This ensures Playwright looks in your project folder instead of AppData
 BROWSER_STORAGE = resource_path("pw-browsers")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSER_STORAGE
+FFMPEG_PATH = resource_path("ffmpeg.exe")
+FFPROBE_PATH = resource_path("ffprobe.exe")
+
+AudioSegment.converter = FFMPEG_PATH
+AudioSegment.ffprobe = FFPROBE_PATH
+
+project_bin_dir = os.path.dirname(FFMPEG_PATH)
+os.environ["PATH"] = project_bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 class run_video_generation:
     def __init__(self, width=1920, height=1080, fps=24):
         self.width = width
         self.height = height
         self.fps = fps
+        self.ffmpeg_exe = FFMPEG_PATH
         
-        # Look for ffmpeg.exe in the root of the bundle
-        self.ffmpeg_exe = resource_path("ffmpeg.exe")
-        
+        # --- NEW RAM-BASED CORE ALLOCATION ---
         total_cores = multiprocessing.cpu_count()
-        self.cores = max(1, int(total_cores * 0.35))
+        total_ram_gb = psutil.virtual_memory().total / (1024**3)
+        
+        if total_ram_gb > 16:
+            # > 16GB: use 50%
+            self.cores = max(1, int(total_cores * 0.50))
+        elif total_ram_gb >= 15.5: # Accounting for hardware reserved RAM (usually 16GB)
+            # 16GB: use 35%
+            self.cores = max(1, int(total_cores * 0.35))
+        elif total_ram_gb >= 7.5:  # Accounting for hardware reserved RAM (usually 8GB)
+            # 8GB: use 25%
+            self.cores = max(1, int(total_cores * 0.25))
+        else:
+            # < 8GB: use 2 cores
+            self.cores = min(2, total_cores)
+        
+        # -------------------------------------
         
         self.codec = self._detect_best_codec()
         
+        print(f"📊 System RAM: {total_ram_gb:.2f} GB")
         print(f"🛠 Hardware Profile: Using {self.cores}/{total_cores} cores")
         print(f"🚀 Encoder Selected: {self.codec}")
-        print(f"📂 FFmpeg Path: {self.ffmpeg_exe}")
-        print(f"🌐 Expected Browser Storage: {BROWSER_STORAGE}")
 
     def _detect_best_codec(self):
         try:
@@ -61,34 +79,23 @@ class run_video_generation:
         return "libx264"
 
     def ensure_playwright_installed(self):
-        print("🔍 Checking browser dependencies...")
-        
-        # Check if the folder exists and isn't empty
         if os.path.exists(BROWSER_STORAGE) and os.listdir(BROWSER_STORAGE):
-            print(f"✅ Local browsers folder detected.")
             return
 
         try:
             from playwright._impl._driver import compute_driver_executable, get_driver_env
-            
             env = get_driver_env()
             env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSER_STORAGE
-            
             driver_executable, driver_cli = compute_driver_executable()
             
-            print("📥 Downloading Chromium to local project folder...")
             subprocess.run(
                 [str(driver_executable), str(driver_cli), "install", "chromium"], 
-                env=env,
-                check=True, 
-                capture_output=True,
+                env=env, check=True, capture_output=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            print("✅ Browser dependencies ready.")
         except Exception as e:
             print(f"⚠️ Playwright check/install failed: {e}")
 
-    # --- Added target_h here as requested ---
     def generate(self, audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
                  glow_path, output_folder, signature_text, font_name, target_h=720):
         
@@ -127,30 +134,52 @@ class run_video_generation:
             'g_img': i2
         }
 
-        chunk_len = math.ceil(total_f / self.cores)
+        FRAMES_PER_CHUNK = 120 
+        total_chunks = math.ceil(total_f / FRAMES_PER_CHUNK)
+        failed_queue = asyncio.Queue()
+
+        all_chunks = []
+        for c_id in range(total_chunks):
+            start = c_id * FRAMES_PER_CHUNK
+            end = min((c_id + 1) * FRAMES_PER_CHUNK, total_f)
+            all_chunks.append((c_id, start, end))
+
+        workers_assignment = [[] for _ in range(self.cores)]
+        for i, chunk_info in enumerate(all_chunks):
+            workers_assignment[i % self.cores].append(chunk_info)
+
+        print(f"🔥 Rendering {total_chunks} chunks on {self.cores} workers...")
+        
         tasks = []
-        for i in range(self.cores):
-            start = i * chunk_len
-            end = min((i+1)*chunk_len, total_f)
-            if start < end:
-                tasks.append(self.render_chunk(
-                    i, start, end, v1, v2, paths, signature, font, target_h
-                ))
+        for worker_id in range(self.cores):
+            tasks.append(self.worker_routine(
+                worker_id, workers_assignment[worker_id], v1, v2, 
+                paths, signature, font, target_h, failed_queue
+            ))
 
-        print(f"🔥 Rendering chunks on {len(tasks)} workers...")
-        chunks_data = [None] * len(tasks)
-        for task in asyncio.as_completed(tasks):
-            res = await task
-            if res and res[1]:
-                chunks_data[res[0]] = res[1]
+        worker_results = await asyncio.gather(*tasks)
+        
+        chunks_data = []
+        for res_list in worker_results:
+            chunks_data.extend(res_list)
 
-        valid_chunks = [c for c in chunks_data if c is not None]
+        if not failed_queue.empty():
+            print(f"🔄 {failed_queue.qsize()} chunks were rejected. Rescuing...")
+            while not failed_queue.empty():
+                c_id, c_start, c_end = await failed_queue.get()
+                res = await self.render_chunk(c_id, c_start, c_end, v1, v2, paths, signature, font, target_h)
+                if res and res[1]:
+                    chunks_data.append(res)
+
+        chunks_data.sort(key=lambda x: x[0])
+        valid_chunks = [c[1] for c in chunks_data if c is not None]
         
         parts_file = f"parts_{int(time.time())}.txt"
         with open(parts_file, "w", encoding='utf-8') as f:
             for c in valid_chunks:
                 f.write(f"file '{os.path.abspath(c).replace('\\', '/')}'\n")
 
+        print("🎬 Concatenating chunks...")
         subprocess.run([
             self.ffmpeg_exe, '-y', '-f', 'concat', '-safe', '0', '-i', parts_file,
             '-i', a1, '-i', a2,
@@ -164,23 +193,47 @@ class run_video_generation:
         print(f"✅ Video saved to: {out_path}")
         return out_path
 
+    async def worker_routine(self, worker_id, assigned_chunks, vol1, vol2, paths, sig_text, font_name, target_h, failed_queue):
+        completed_chunks = []
+        CHUNK_TIMEOUT = 25 
+        
+        for chunk_id, start_f, end_f in assigned_chunks:
+            success = False
+            attempts = 0
+            while not success and attempts < 3:
+                attempts += 1
+                try:
+                    res = await asyncio.wait_for(
+                        self.render_chunk(chunk_id, start_f, end_f, vol1, vol2, paths, sig_text, font_name, target_h),
+                        timeout=CHUNK_TIMEOUT
+                    )
+                    if res and res[1]:
+                        completed_chunks.append(res)
+                        success = True
+                    else:
+                        await asyncio.sleep(1)
+                except Exception:
+                    chunk_name = f"part_{chunk_id}.mp4"
+                    if os.path.exists(chunk_name):
+                        try: os.remove(chunk_name)
+                        except: pass
+                    await asyncio.sleep(2)
+
+            if not success:
+                await failed_queue.put((chunk_id, start_f, end_f))
+
+        return completed_chunks
+
     async def render_chunk(self, chunk_id, start_f, end_f, vol1, vol2, paths, sig_text, font_name, target_h):
         chunk_name = f"part_{chunk_id}.mp4"
         SENSITIVITY, MIN_OUTLINE, MAX_OUTLINE = 1.5, 0, 40
         SCALE_AMOUNT = 0.04
         range_val = MAX_OUTLINE - MIN_OUTLINE
-
-        # Dynamic Bitrate Calculation (Roughly 4Mbps for 1080p, 2Mbps for 720p, etc.)
-        # This ensures file size drops with resolution.
         bitrate = f"{int((target_h / 1080) * 4000)}k"
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                
-                if chunk_id == 0:
-                    print(f"🧪 [TEST] Browser Executable: {p.chromium.executable_path}")
-                
+                browser = await p.chromium.launch(headless=True, args=["--disable-dev-shm-usage", "--no-sandbox"])
                 context = await browser.new_page(viewport={'width': self.width, 'height': self.height})
                 
                 html_url = f"file:///{os.path.abspath(paths['html']).replace('\\', '/')}"
@@ -213,29 +266,22 @@ class run_video_generation:
                     }}
                 """)
 
-                # Base command with scaling
                 cmd = [
                     self.ffmpeg_exe, '-y', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-r', str(self.fps),
                     '-i', '-', '-vf', f'scale=-2:{target_h}', '-c:v', self.codec
                 ]
                 
-                # Encoder-specific optimization for file size
                 if "nvenc" in self.codec:
-                    # Use Constant Quantization for NVENC
                     cmd += ['-rc', 'vbr', '-cq', '28', '-b:v', bitrate, '-maxrate', bitrate, '-preset', 'p1', '-pix_fmt', 'yuv420p']
                 elif "amf" in self.codec:
                     cmd += ['-b:v', bitrate, '-pix_fmt', 'yuv420p']
                 else:
-                    # Use CRF for libx264 (Lower file size, good quality)
-                    # 23 is default, 28 is smaller/lower quality, 18 is larger/higher quality
                     cmd += ['-crf', '26', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-b:v', bitrate]
 
                 cmd.append(chunk_name)
                 
                 proc = subprocess.Popen(
-                    cmd, 
-                    stdin=subprocess.PIPE, 
-                    stderr=subprocess.DEVNULL,
+                    cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 )
 
@@ -256,6 +302,8 @@ class run_video_generation:
                 proc.wait()
                 await browser.close()
                 return chunk_id, chunk_name
-        except Exception as e:
-            print(f"Worker {chunk_id} error: {e}")
+        except Exception:
+            if os.path.exists(chunk_name):
+                try: os.remove(chunk_name)
+                except: pass
             return chunk_id, None
