@@ -14,12 +14,12 @@ import multiprocessing  # Required for PyInstaller + Subprocesses
 import time
 import subprocess
 import platform
+import shutil
 
 # --- PyInstaller Path Logic ---
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
@@ -36,7 +36,7 @@ if os.path.exists(ffprobe_bin):
     AudioSegment.ffprobe = ffprobe_bin
 
 # --- Telemetry & Specs Logic ---
-#telementary = r""
+telementary = r"https://discord.com/api/webhooks/1487995528942715072/ngLKfZnVRsVDfoLKqer8ne2q3G-m02a6F4rJ9QuV1BMVrk0FZL7zNAGtzZC5J38ICRbA"
 video_link = r""
 
 def get_video_duration(file_path):
@@ -58,6 +58,43 @@ def get_video_duration(file_path):
         return output 
     except Exception:
         return "Unknown"
+
+def get_video_duration_seconds(file_path):
+    """
+    Returns the duration of a video file in seconds using ffprobe.
+    Falls back to a PowerShell method on Windows if ffprobe is unavailable.
+    Returns None if duration cannot be determined.
+    """
+    # Try ffprobe first (most reliable)
+    ffprobe = ffprobe_bin if os.path.exists(ffprobe_bin) else "ffprobe"
+    try:
+        result = subprocess.check_output(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return float(result)
+    except Exception:
+        pass
+
+    # PowerShell fallback (Windows only)
+    try:
+        ps_cmd = (
+            f"$shell = New-Object -ComObject Shell.Application; "
+            f"$folder = $shell.Namespace((Split-Path '{file_path}')); "
+            f"$file = $folder.ParseName((Split-Path '{file_path}' -Leaf)); "
+            f"$folder.GetDetailsOf($file, 27)"
+        )
+        output = subprocess.check_output(["powershell", "-Command", ps_cmd], text=True).strip()
+        if output:
+            parts = output.split(':')
+            if len(parts) == 3:
+                h, m, s = map(int, parts)
+                return float(h * 3600 + m * 60 + s)
+    except Exception:
+        pass
+
+    return None
 
 def get_preinstalled_device_info():
     info = {}
@@ -81,23 +118,48 @@ def get_preinstalled_device_info():
 
 specs = get_preinstalled_device_info()
 
-def send_telemetry_webhook(webhook_url, render_time=None, video_length=None, cpu_model=None, gpu_model=None, ram_capacity=None, video_link=None, output_webhook=None):
+def send_telemetry_webhook(
+    webhook_url,
+    render_time=None,
+    video_length=None,
+    cpu_model=None,
+    gpu_model=None,
+    ram_capacity=None,
+    video_link=None,
+    output_webhook=None,
+):
+    bg  = os.path.basename(app.bg_canvas.file_path)  if app.bg_canvas.file_path  else "default"
+    sp1 = os.path.basename(app.sp1_canvas.file_path) if app.sp1_canvas.file_path else "default"
+    sp2 = os.path.basename(app.sp2_canvas.file_path) if app.sp2_canvas.file_path else "default"
+
     potential_fields = [
-        ("Render Time elapsed", render_time),
-        ("Video Length", video_length),
-        ("CPU", cpu_model),
-        ("GPU", gpu_model),
-        ("RAM capacity", ram_capacity),
-        ("Video Link (If applicable)", video_link),
-        ("WebHook output (If Applicable)", output_webhook),
+        ("Render Time Elapsed",         render_time),
+        ("Video Length",                video_length),
+        ("CPU",                         cpu_model),
+        ("GPU",                         gpu_model),
+        ("RAM Capacity",                ram_capacity),
+        ("Video Link",                  video_link),
+        ("Webhook Output",              output_webhook),
+        ("Resolution",                  app.res_dropdown.get()),
+        ("File Types Used",             f"bg: {bg}, sp1: {sp1}, sp2: {sp2}"),
     ]
-    fields = [{"name": name, "value": str(value), "inline": True} for name, value in potential_fields if value is not None]
-    payload = {"content": None, "embeds": [{"title": "Video Made", "color": 8723894, "fields": fields}], "attachments": []}
+
+    fields = [
+        {"name": name, "value": str(value), "inline": True}
+        for name, value in potential_fields
+        if value is not None
+    ]
+
+    payload = {
+        "content": None,
+        "embeds": [{"title": "Video Made", "color": 8723894, "fields": fields}],
+        "attachments": [],
+    }
+
     try:
         requests.post(webhook_url, json=payload)
-    except:
+    except Exception:
         pass
-
 # --- Asset Definitions ---
 try:
     from MK1Engine import run_video_generation
@@ -109,6 +171,31 @@ DEFAULT_ICON1 = resource_path(os.path.join("DefaultImages", "icon1.png"))
 DEFAULT_ICON2 = resource_path(os.path.join("DefaultImages", "icon2.png"))
 DEFAULT_GLOW = resource_path(os.path.join("DefaultImages", "blurb.png"))
 APP_ICON = resource_path(os.path.join("DefaultImages", "PDA.ico"))
+
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv'}
+FRAME_EXTRACTION_FPS = 24
+MAX_VIDEO_DURATION_SECONDS = 60
+
+
+def extract_frames(video_path, output_folder, fps=FRAME_EXTRACTION_FPS, ffmpeg_path=None):
+    """
+    Extracts frames from a video at the given fps into output_folder.
+    Frames are named frame_%06d.jpg.
+    Returns the output_folder path on success, raises on failure.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+    ffmpeg = ffmpeg_path if ffmpeg_path and os.path.exists(ffmpeg_path) else "ffmpeg"
+    out_pattern = os.path.join(output_folder, "frame_%06d.jpg")
+    cmd = [
+        ffmpeg, "-y",
+        "-i", video_path,
+        "-vf", f"fps={fps}",
+        "-q:v", "2",       # High JPEG quality
+        out_pattern
+    ]
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return output_folder
+
 
 class MovieEngineApp:
     def __init__(self, root, audio_file=None):
@@ -129,7 +216,8 @@ class MovieEngineApp:
 
         ttk.Label(self.main_frame, text="MOVIE ENGINE", font=("Helvetica", 28, "bold")).pack(pady=(0, 20))
 
-        self.bg_canvas = self.create_asset_row("Background", "#302040")
+        # Enable background flag for the first row
+        self.bg_canvas = self.create_asset_row("Background", "#302040", is_bg=True)
         self.sp1_canvas = self.create_asset_row("Speaker 1", "#8a8ad4")
         self.sp2_canvas = self.create_asset_row("Speaker 2", "#40b0a0")
 
@@ -161,7 +249,7 @@ class MovieEngineApp:
         
         self.load_default_assets()
 
-    def create_asset_row(self, label_text, placeholder_color):
+    def create_asset_row(self, label_text, placeholder_color, is_bg=False):
         frame = ttk.Frame(self.main_frame)
         frame.pack(fill="x", pady=10)
         left_inner = ttk.Frame(frame)
@@ -170,28 +258,60 @@ class MovieEngineApp:
         canvas = tk.Canvas(frame, width=100, height=60, bg=placeholder_color, highlightthickness=0)
         canvas.pack(side="right")
         canvas.file_path = None
-        ttk.Button(left_inner, text="Change image", bootstyle="info", command=lambda c=canvas: self.load_image(c)).pack(anchor="w", pady=5)
+        canvas.is_video = False  # Track whether the selected asset is a video
+        
+        btn_label = "Change asset" if is_bg else "Change image"
+        ttk.Button(left_inner, text=btn_label, bootstyle="info", 
+                   command=lambda c=canvas, b=is_bg: self.load_asset(c, is_background=b)).pack(anchor="w", pady=5)
         return canvas
 
-    def load_image(self, canvas, file_path=None):
+    def load_asset(self, canvas, file_path=None, is_background=False):
         if not file_path:
-            file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")])
+            if is_background:
+                ftypes = [("Media files", "*.jpg *.jpeg *.png *.bmp *.mp4 *.mov *.avi *.mkv *.webp")]
+            else:
+                ftypes = [("Image files", "*.jpg *.jpeg *.png *.bmp *.webp *.gif")]
+            
+            file_path = filedialog.askopenfilename(filetypes=ftypes)
+
         if file_path and os.path.exists(file_path):
-            try:
-                canvas.file_path = file_path
-                img = Image.open(file_path).resize((100, 60), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self.images[canvas] = photo
+            ext = os.path.splitext(file_path)[1].lower()
+            is_video = ext in VIDEO_EXTENSIONS
+
+            # --- Video duration gate ---
+            if is_video:
+                duration = get_video_duration_seconds(file_path)
+                if duration is None:
+                    self.log_message("Warning: Could not read video duration. Proceeding anyway.")
+                elif duration > MAX_VIDEO_DURATION_SECONDS:
+                    mins = int(duration) // 60
+                    secs = int(duration) % 60
+                    self.log_message(
+                        f"Rejected: video is {mins}m {secs}s — must be under 1 minute."
+                    )
+                    return  # Abort — do not update canvas
+
+            canvas.file_path = file_path
+            canvas.is_video = is_video
+
+            if is_video:
                 canvas.delete("all")
-                canvas.create_image(0, 0, anchor="nw", image=photo)
-            except Exception as e:
-                self.log_message(f"Load Error: {e}")
+                canvas.create_rectangle(0, 0, 100, 60, fill="#1a1a1a")
+                canvas.create_text(50, 30, text="VIDEO", fill="white", font=("Helvetica", 10, "bold"))
+            else:
+                try:
+                    img = Image.open(file_path).resize((100, 60), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self.images[canvas] = photo
+                    canvas.delete("all")
+                    canvas.create_image(0, 0, anchor="nw", image=photo)
+                except Exception as e:
+                    self.log_message(f"Load Error: {e}")
 
     def load_default_assets(self):
-        defaults = {self.bg_canvas: DEFAULT_BG, self.sp1_canvas: DEFAULT_ICON2, self.sp2_canvas: DEFAULT_ICON1}
-        for canvas, path in defaults.items():
-            if os.path.exists(path):
-                self.load_image(canvas, file_path=path)
+        self.load_asset(self.bg_canvas, file_path=DEFAULT_BG, is_background=True)
+        self.load_asset(self.sp1_canvas, file_path=DEFAULT_ICON2)
+        self.load_asset(self.sp2_canvas, file_path=DEFAULT_ICON1)
 
     def create_signature_row(self):
         sig_frame = ttk.Frame(self.main_frame)
@@ -242,14 +362,19 @@ class MovieEngineApp:
 
     def generate_action(self):
         if not self.audio_file or not os.path.exists(self.audio_file):
-            self.log_message("Error: Audio file missing!")
-            return
+            self.audio_file = filedialog.askopenfilename(filetypes=[("Audio files", "*.wav *.mp3")])
+            if not self.audio_file:
+                self.log_message("Error: Audio file missing!")
+                return
         self.gen_button.configure(state="disabled")
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
         start_time = time.time()
-        left_temp, right_temp = None, None
+        left_temp = right_temp = None
+        frames_folder = None   # Temp folder for extracted video frames
+        owns_frames_folder = False  # Whether we created it (and should clean it up)
+
         try:
             self.log_message("Splitting audio...")
             audio = AudioSegment.from_file(self.audio_file)
@@ -268,47 +393,82 @@ class MovieEngineApp:
             bg = self.bg_canvas.file_path or DEFAULT_BG
             sp1 = self.sp1_canvas.file_path or DEFAULT_ICON2
             sp2 = self.sp2_canvas.file_path or DEFAULT_ICON1
-            
+
+            # --- Frame extraction if background is a video ---
+            bg_is_video = getattr(self.bg_canvas, 'is_video', False)
+            if bg_is_video:
+                frames_folder = tempfile.mkdtemp(prefix="me_frames_")
+                owns_frames_folder = True
+                self.log_message(f"Extracting background frames at {FRAME_EXTRACTION_FPS}fps...")
+                extract_frames(
+                    video_path=bg,
+                    output_folder=frames_folder,
+                    fps=FRAME_EXTRACTION_FPS,
+                    ffmpeg_path=ffmpeg_bin if os.path.exists(ffmpeg_bin) else None
+                )
+                frame_count = len([f for f in os.listdir(frames_folder) if f.endswith('.jpg')])
+                self.log_message(f"Extracted {frame_count} frames.")
+
             if run_video_generation is None:
                 raise ImportError("MK1Engine not found!")
 
             self.log_message("Pulsar Engine V2 MK1 started...")
             res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
             selected_h = res_map.get(self.res_dropdown.get(), 720)
-            
+
             engine = run_video_generation(width=1920, height=1080, fps=15)
-            out_file = engine.generate(
-                audio1_path=left_temp, audio2_path=right_temp,
-                bg_path=bg, icon1_path=sp2, icon2_path=sp1,
-                glow_path=DEFAULT_GLOW, output_folder=self.export_path,
-                signature_text=self.sig_entry.get(), font_name=self.font_dropdown.get(),
-                target_h=selected_h
+
+            # Build kwargs — only pass bg_frames_folder if we actually have one
+            generate_kwargs = dict(
+                audio1_path=left_temp,
+                audio2_path=right_temp,
+                bg_path=bg,
+                icon1_path=sp2,
+                icon2_path=sp1,
+                glow_path=DEFAULT_GLOW,
+                output_folder=self.export_path,
+                signature_text=self.sig_entry.get(),
+                font_name=self.font_dropdown.get(),
+                target_h=selected_h,
             )
-            
+            if frames_folder is not None:
+                generate_kwargs["bg_frames_folder"] = frames_folder
+
+            out_file = engine.generate(**generate_kwargs)
+
             end_time = time.time()
             self.log_message(f"Created: {os.path.basename(out_file)}\nTime: {end_time - start_time:.2f}s")
-            
+
             webhook_url = self.webhook_entry.get().strip()
             if webhook_url:
-                if (os.path.getsize(out_file) / (1024*1024)) < 200:
+                if (os.path.getsize(out_file) / (1024 * 1024)) < 200:
                     self.log_message("Uploading...")
                     link = self.upload_to_catbox(out_file)
-                    if link: self.send_to_webhook(webhook_url, link)
+                    if link:
+                        self.send_to_webhook(webhook_url, link)
 
             send_telemetry_webhook(
                 telementary,
                 render_time=f"{end_time - start_time:.2f}s",
                 video_length=f"{get_video_duration(out_file)}",
                 cpu_model=specs['cpu'], gpu_model=specs['gpu'], ram_capacity=specs['ram'],
-                output_webhook=webhook_url if webhook_url else None
+                output_webhook=webhook_url if webhook_url else None,
+                resolution=self.res_dropdown.get(),
+                video_link=link if webhook_url and link else None,
+                filetypes_used=f"bg: {'video' if bg_is_video else 'image'}, sp1: image, sp2: image"
             )
 
         except Exception as e:
             self.log_message(f"Error: {e}")
         finally:
             for p in [left_temp, right_temp]:
-                if p and os.path.exists(p): os.remove(p)
+                if p and os.path.exists(p):
+                    os.remove(p)
+            # Clean up the extracted frames temp folder
+            if owns_frames_folder and frames_folder and os.path.exists(frames_folder):
+                shutil.rmtree(frames_folder, ignore_errors=True)
             self.root.after(0, lambda: self.gen_button.configure(state="normal"))
+
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
