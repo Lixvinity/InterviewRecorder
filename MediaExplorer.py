@@ -22,13 +22,20 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 # 1. BUNDLED ASSETS
-# Ensure ffmpeg.exe is in your project root during the build process
+# Ensure ffmpeg.exe and ffprobe.exe are in your project root during the build process
 FFMPEG_PATH = resource_path("ffmpeg.exe")
+FFPROBE_PATH = resource_path("ffprobe.exe")
+
+# Assign paths to pydub
 AudioSegment.converter = FFMPEG_PATH
+AudioSegment.ffprobe = FFPROBE_PATH
+
+# --- CRITICAL ADDITION: Inject the project folder into the system PATH ---
+# This ensures any other library or standard subprocess call finds them here first
+project_bin_dir = os.path.dirname(FFMPEG_PATH)
+os.environ["PATH"] = project_bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 # 2. DYNAMIC IMPORTS
-# Using resource_path isn't needed for .py imports, but ensure movieengine.py 
-# is passed as a hidden import or bundled in the same directory.
 try:
     from movieengine import MovieEngineApp 
 except ImportError:
@@ -44,13 +51,12 @@ class MediaExplorer(tb.Toplevel):
         self.attributes('-topmost', True) 
 
         # Corrected Icon Pathing
-        # Note: DefaultImages folder must be bundled in the build command
         icon_path = resource_path(os.path.join("DefaultImages", "PDA.ico"))
         if os.path.exists(icon_path):
             try:
                 self.iconbitmap(icon_path)
             except Exception:
-                pass # Prevent crash if icon format is weird on certain OS versions
+                pass 
 
         header = tb.Label(self, text="Logged Interviews", font=("Helvetica", 22, "bold"), bootstyle="light")
         header.pack(pady=20)
@@ -138,6 +144,7 @@ class MediaExplorer(tb.Toplevel):
 
 if __name__ == "__main__":
     root = tb.Window(themename="darkly")
+    # Note: Make sure this directory exists or use a dynamic path
     my_path = Path.home() / "Documents" / "recordings"
     app = MediaExplorer(root, my_path)
     root.mainloop()
