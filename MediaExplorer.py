@@ -1,10 +1,13 @@
 import os
+import shutil
 import tempfile
 import numpy as np
 from pathlib import Path
 import ttkbootstrap as tb
 from ttkbootstrap.scrolled import ScrolledFrame
 from ttkbootstrap.dialogs import Messagebox
+from ttkbootstrap.dialogs.dialogs import Querybox
+from tkinter import filedialog
 from pydub import AudioSegment
 import tkinter as tk
 import sys
@@ -97,6 +100,7 @@ class MediaExplorer(tb.Toplevel):
         display_name = (file_path.name[:35] + '..') if len(file_path.name) > 35 else file_path.name
         tb.Label(row_container, text=display_name, width=40, anchor="w").pack(side="left", padx=10)
 
+        # Packed from Right to Left
         tb.Button(row_container, text="Delete", bootstyle="danger-outline", width=8,
                   command=lambda fp=file_path: self.delete_file(fp)).pack(side="right", padx=3)
         
@@ -106,7 +110,87 @@ class MediaExplorer(tb.Toplevel):
         tb.Button(row_container, text="Make Video", bootstyle="info", width=12, 
                   command=lambda fp=file_path: self.open_movie_maker(fp)).pack(side="right", padx=3)
 
+        tb.Button(row_container, text="Export", bootstyle="warning", width=8, 
+                  command=lambda fp=file_path: self.open_export_dialog(fp)).pack(side="right", padx=3)
+
+        tb.Button(row_container, text="Rename", bootstyle="secondary", width=8, 
+                  command=lambda fp=file_path: self.rename_file(fp)).pack(side="right", padx=3)
+
         tb.Separator(self.list_frame, bootstyle="dark").pack(fill="x", padx=10, pady=2)
+
+    def rename_file(self, file_path):
+        new_name = Querybox.get_string(
+            prompt="Enter new file name (without extension):", 
+            title="Rename File", 
+            initialvalue=file_path.stem
+        )
+        if new_name:
+            new_path = file_path.with_name(f"{new_name}.mp3")
+            if new_path.exists():
+                Messagebox.show_error("A file with this name already exists.", "Rename Error")
+            else:
+                try:
+                    file_path.rename(new_path)
+                    self.load_files()
+                except Exception as e:
+                    Messagebox.show_error(f"Could not rename file: {e}", "Rename Error")
+
+    def open_export_dialog(self, file_path):
+        export_win = tb.Toplevel(self)
+        export_win.title("Export Options")
+        export_win.geometry("300x230")
+        export_win.resizable(False, False)
+        export_win.attributes('-topmost', True)
+        export_win.grab_set()  # Make window modal
+
+        tb.Label(export_win, text=f"Export: {file_path.name[:20]}...", font=("Helvetica", 12, "bold")).pack(pady=15)
+
+        def choose_dir_and_export(mode):
+            export_dir = filedialog.askdirectory(title="Select Destination Folder")
+            if not export_dir:
+                return
+            export_win.destroy()
+            self.perform_export(file_path, Path(export_dir), mode)
+
+        tb.Button(export_win, text="Merged Channels (Mono)", bootstyle="primary", 
+                  command=lambda: choose_dir_and_export("merged")).pack(fill="x", padx=20, pady=5)
+        tb.Button(export_win, text="Split Channels (L/R)", bootstyle="primary", 
+                  command=lambda: choose_dir_and_export("split")).pack(fill="x", padx=20, pady=5)
+        tb.Button(export_win, text="Raw File (Copy)", bootstyle="primary", 
+                  command=lambda: choose_dir_and_export("raw")).pack(fill="x", padx=20, pady=5)
+
+    def perform_export(self, file_path, export_dir, mode):
+        try:
+            base_name = file_path.stem
+            
+            if mode == "raw":
+                shutil.copy2(file_path, export_dir / file_path.name)
+                Messagebox.show_info("Raw file exported successfully.", "Export Complete")
+                
+            elif mode == "merged":
+                audio = AudioSegment.from_mp3(file_path)
+                # pydub's set_channels(1) mixes down multi-channel audio to mono
+                mono_audio = audio.set_channels(1)
+                export_path = export_dir / f"{base_name}_merged.mp3"
+                mono_audio.export(export_path, format="mp3")
+                Messagebox.show_info("Merged file exported successfully.", "Export Complete")
+                
+            elif mode == "split":
+                audio = AudioSegment.from_mp3(file_path)
+                if audio.channels == 1:
+                    Messagebox.show_warning("File is already mono. Exporting as is.", "Notice")
+                    export_path = export_dir / f"{base_name}_mono.mp3"
+                    audio.export(export_path, format="mp3")
+                else:
+                    left, right = audio.split_to_mono()
+                    left_path = export_dir / f"{base_name}_Left.mp3"
+                    right_path = export_dir / f"{base_name}_Right.mp3"
+                    left.export(left_path, format="mp3")
+                    right.export(right_path, format="mp3")
+                    Messagebox.show_info("Split channels exported successfully.", "Export Complete")
+                    
+        except Exception as e:
+            Messagebox.show_error(f"Export failed: {e}", "Export Error")
 
     def process_and_play(self, file_path):
         try:
@@ -146,5 +230,9 @@ if __name__ == "__main__":
     root = tb.Window(themename="darkly")
     # Note: Make sure this directory exists or use a dynamic path
     my_path = Path.home() / "Documents" / "recordings"
+    
+    # Create the directory if it doesn't exist to prevent errors on initial load
+    my_path.mkdir(parents=True, exist_ok=True)
+    
     app = MediaExplorer(root, my_path)
     root.mainloop()
