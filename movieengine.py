@@ -6,6 +6,7 @@ from PIL import Image, ImageTk
 import os
 import threading
 import tempfile
+import queue
 from pathlib import Path
 from pydub import AudioSegment
 import sys
@@ -36,7 +37,7 @@ if os.path.exists(ffprobe_bin):
     AudioSegment.ffprobe = ffprobe_bin
 
 # --- Telemetry & Specs Logic ---
-telementary = r"https://discord.com/api/webhooks/1487995528942715072/ngLKfZnVRsVDfoLKqer8ne2q3G-m02a6F4rJ9QuV1BMVrk0FZL7zNAGtzZC5J38ICRbA"
+telemetry_url = r"https://discord.com/api/webhooks/1487995528942715072/ngLKfZnVRsVDfoLKqer8ne2q3G-m02a6F4rJ9QuV1BMVrk0FZL7zNAGtzZC5J38ICRbA"
 video_link = r""
 
 def get_video_duration(file_path):
@@ -119,7 +120,7 @@ def get_preinstalled_device_info():
 specs = get_preinstalled_device_info()
 
 def send_telemetry_webhook(
-    webhook_url,
+    telemetry_url,
     render_time=None,
     video_length=None,
     cpu_model=None,
@@ -127,39 +128,53 @@ def send_telemetry_webhook(
     ram_capacity=None,
     video_link=None,
     output_webhook=None,
+    resolution=None,
+    file_types=None,
+    app_context=None  # Pass the app object explicitly to avoid Scope errors
 ):
-    bg  = os.path.basename(app.bg_canvas.file_path)  if app.bg_canvas.file_path  else "default"
-    sp1 = os.path.basename(app.sp1_canvas.file_path) if app.sp1_canvas.file_path else "default"
-    sp2 = os.path.basename(app.sp2_canvas.file_path) if app.sp2_canvas.file_path else "default"
+    # Safely get file names from the app context if provided
+    bg = "default"
+    if app_context:
+        try:
+            bg = os.path.basename(app_context.bg_canvas.file_path) if app_context.bg_canvas.file_path else "default"
+            # Add sp1/sp2 logic here if you want to include them in the embed fields
+        except AttributeError:
+            pass
 
+    # Map your data to the Discord Embed Field format
     potential_fields = [
-        ("Render Time Elapsed",         render_time),
-        ("Video Length",                video_length),
-        ("CPU",                         cpu_model),
-        ("GPU",                         gpu_model),
-        ("RAM Capacity",                ram_capacity),
-        ("Video Link",                  video_link),
-        ("Webhook Output",              output_webhook),
-        ("Resolution",                  app.res_dropdown.get()),
-        ("File Types Used",             f"bg: {bg}, sp1: {sp1}, sp2: {sp2}"),
+        ("Render Time", render_time),
+        ("Video Length", video_length),
+        ("CPU", cpu_model),
+        ("GPU", gpu_model),
+        ("RAM", ram_capacity),
+        ("Resolution", resolution),
+        ("Files", file_types),
+        ("Output Webhook", output_webhook),
+        ("Video Link", video_link),
     ]
 
+    # Clean the list: Discord rejects empty strings or None values in fields
     fields = [
         {"name": name, "value": str(value), "inline": True}
         for name, value in potential_fields
-        if value is not None
+        if value not in [None, "", "None"]
     ]
 
     payload = {
-        "content": None,
-        "embeds": [{"title": "Video Made", "color": 8723894, "fields": fields}],
-        "attachments": [],
+        "embeds": [{
+            "title": "🚀 Video Rendered Successfully",
+            "color": 8723894, # A nice purple-ish color
+            "fields": fields,
+            "footer": {"text": f"Background: {bg}"}
+        }]
     }
 
     try:
-        requests.post(webhook_url, json=payload)
-    except Exception:
-        pass
+        # Added a timeout so the app doesn't hang if the Discord API is slow
+        requests.post(telemetry_url, json=payload, timeout=10)
+    except requests.exceptions.RequestException as e:
+        print(f"Telemetry failed: {e}")
 # --- Asset Definitions ---
 try:
     from MK1Engine import run_video_generation
@@ -206,7 +221,8 @@ class MovieEngineApp:
         self.style = Style(theme="darkly")
         self.images = {}
         self.export_path = str(Path.home() / "Downloads")
-        
+        self.log_queue = queue.Queue()
+
         if os.path.exists(APP_ICON):
             try: self.root.iconbitmap(APP_ICON)
             except: pass 
@@ -248,6 +264,13 @@ class MovieEngineApp:
         self.log_box.pack(fill="both", expand=True, pady=5)
         
         self.load_default_assets()
+        self._poll_log_queue()
+
+    def _poll_log_queue(self):
+        while not self.log_queue.empty():
+            msg = self.log_queue.get_nowait()
+            self.log_message(msg)
+        self.root.after(100, self._poll_log_queue)
 
     def create_asset_row(self, label_text, placeholder_color, is_bg=False):
         frame = ttk.Frame(self.main_frame)
@@ -416,7 +439,10 @@ class MovieEngineApp:
             res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
             selected_h = res_map.get(self.res_dropdown.get(), 720)
 
-            engine = run_video_generation(width=1920, height=1080, fps=15)
+            engine = run_video_generation(
+                width=1920, height=1080, fps=15,
+                log_callback=lambda msg: self.log_queue.put(msg)
+            )
 
             # Build kwargs — only pass bg_frames_folder if we actually have one
             generate_kwargs = dict(
@@ -440,6 +466,8 @@ class MovieEngineApp:
             self.log_message(f"Created: {os.path.basename(out_file)}\nTime: {end_time - start_time:.2f}s")
 
             webhook_url = self.webhook_entry.get().strip()
+            link = None  # define it here so it always exists
+
             if webhook_url:
                 if (os.path.getsize(out_file) / (1024 * 1024)) < 200:
                     self.log_message("Uploading...")
@@ -448,14 +476,17 @@ class MovieEngineApp:
                         self.send_to_webhook(webhook_url, link)
 
             send_telemetry_webhook(
-                telementary,
+                telemetry_url,
                 render_time=f"{end_time - start_time:.2f}s",
-                video_length=f"{get_video_duration(out_file)}",
-                cpu_model=specs['cpu'], gpu_model=specs['gpu'], ram_capacity=specs['ram'],
-                output_webhook=webhook_url if webhook_url else None,
-                resolution=self.res_dropdown.get(),
-                video_link=link if webhook_url and link else None,
-                filetypes_used=f"bg: {'video' if bg_is_video else 'image'}, sp1: image, sp2: image"
+                video_length=get_video_duration(out_file),
+                cpu_model=specs.get('cpu'),
+                gpu_model=specs.get('gpu'),
+                ram_capacity=specs.get('ram'),
+                output_webhook=webhook_url or "None Provided",
+                resolution=self.res_dropdown.get() or "Unknown",
+                video_link=link if (webhook_url and link) else None,
+                file_types=f"bg: {'video' if bg_is_video else 'image'}, sp1: img, sp2: img",
+                app_context=self # Assuming 'self' is the app or has access to canvases
             )
 
         except Exception as e:
