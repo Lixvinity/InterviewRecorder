@@ -7,6 +7,7 @@ import math
 import time
 import multiprocessing
 import psutil
+import platform
 from playwright.async_api import async_playwright
 from pydub import AudioSegment
 from scipy.ndimage import gaussian_filter1d
@@ -45,12 +46,24 @@ def _build_frame_index(frames_folder):
     return [os.path.join(frames_folder, f) for f in files]
 
 
+# GPU encoder candidates, ordered by preference.
+# Each entry: (codec, vendor_label, platform_guard)
+# platform_guard = None means all platforms; 'darwin' = macOS only, etc.
+_GPU_CANDIDATES = [
+    ("h264_nvenc",        "NVIDIA NVENC",       None),
+    ("h264_amf",          "AMD AMF",            None),
+    ("h264_qsv",          "Intel QSV",          None),
+    ("h264_videotoolbox", "Apple VideoToolbox", "darwin"),
+]
+
+
 class run_video_generation:
-    def __init__(self, width=1920, height=1080, fps=24):
+    def __init__(self, width=1920, height=1080, fps=24, log_callback=None):
         self.width = width
         self.height = height
         self.fps = fps
         self.ffmpeg_exe = FFMPEG_PATH
+        self.log = log_callback or print
 
         total_cores = multiprocessing.cpu_count()
         total_ram_gb = psutil.virtual_memory().total / (1024**3)
@@ -66,25 +79,146 @@ class run_video_generation:
 
         self.codec = self._detect_best_codec()
 
-        print(f"📊 System RAM: {total_ram_gb:.2f} GB")
-        print(f"🛠 Hardware Profile: Using {self.cores}/{total_cores} cores")
-        print(f"🚀 Encoder Selected: {self.codec}")
+        self.log(f"📊 System RAM: {total_ram_gb:.2f} GB")
+        self.log(f"🛠 Hardware Profile: Using {self.cores}/{total_cores} cores")
+        self.log(f"🚀 Encoder Selected: {self.codec}")
 
     def _detect_best_codec(self):
+        """
+        1. Query ffmpeg for available encoders.
+        2. Walk GPU candidates in priority order, skipping those gated to
+           another platform.
+        3. Validate each listed candidate with a real 1-frame test encode.
+        4. Return the first that passes, or fall back to libx264.
+        """
         try:
-            nv_check = subprocess.run(
+            result = subprocess.run(
                 [self.ffmpeg_exe, "-encoders"],
-                capture_output=True,
-                text=True,
+                capture_output=True, text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            if "h264_nvenc" in nv_check.stdout:
-                return "h264_nvenc"
-            if "h264_amf" in nv_check.stdout:
-                return "h264_amf"
-        except Exception:
-            pass
+            available = result.stdout + result.stderr
+        except Exception as e:
+            self.log(f"⚠️ Could not query FFmpeg encoders: {e}")
+            available = ""
+
+        # Log which GPU codecs are actually listed in this ffmpeg build
+        found_in_binary = [c for c, _, _ in _GPU_CANDIDATES if c in available]
+        if found_in_binary:
+            self.log(f"🔎 GPU codecs present in ffmpeg binary: {', '.join(found_in_binary)}")
+        else:
+            self.log("🔎 No GPU codecs found in ffmpeg binary — binary may lack hardware encoder support")
+
+        current_platform = platform.system().lower()  # 'windows', 'linux', 'darwin'
+
+        for codec, label, platform_guard in _GPU_CANDIDATES:
+            # Skip encoders that only work on a specific OS
+            if platform_guard and current_platform != platform_guard:
+                continue
+
+            if codec not in available:
+                self.log(f"⏭ {label} ({codec}): not in ffmpeg binary — skipping")
+                continue
+
+            self.log(f"🔍 Found {label} encoder ({codec}) — validating…")
+            ok, reason = self._test_encoder(codec)
+            if ok:
+                self.log(f"✅ {label} hardware encoder confirmed: {codec}")
+                return codec
+            else:
+                self.log(f"⚠️ {label} smoke test FAILED — reason: {reason}")
+
+        self.log("ℹ️ No working hardware encoder found; using CPU encoder: libx264")
         return "libx264"
+
+    def _test_encoder(self, codec: str):
+        """
+        Validates a codec by encoding a single synthetic frame.
+        Upped resolution to 256x256 to avoid 'Invalid Argument' errors 
+        caused by hardware minimum size constraints.
+        """
+        extra = {
+            "h264_nvenc":        ["-preset", "p1"],
+            "h264_amf":          [], # AMF is very sensitive to extra params
+            "h264_qsv":          ["-global_quality", "28"],
+            "h264_videotoolbox": ["-q:v", "50"],
+        }.get(codec, [])
+
+        cmd = [
+            self.ffmpeg_exe, "-y",
+            "-f", "lavfi", "-i", "color=black:size=256x256:rate=1", # Increased size
+            "-frames:v", "1",
+            "-c:v", codec,
+            "-pix_fmt", "yuv420p", # Standard format
+        ] + extra + ["-f", "null", "-"]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            if result.returncode == 0:
+                return True, None
+            
+            stderr_lines = [
+                l.strip() for l in
+                result.stderr.decode("utf-8", errors="ignore").splitlines()
+                if l.strip()
+            ]
+            # Capture more lines for better debugging
+            reason = " | ".join(stderr_lines[-3:]) if stderr_lines else f"exit code {result.returncode}"
+            return False, reason
+        except subprocess.TimeoutExpired:
+            return False, "timed out after 10 s"
+        except Exception as e:
+            return False, str(e)
+
+    def _codec_is_gpu(self, codec):
+        return codec in ("h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox")
+
+    def _build_ffmpeg_cmd(self, codec, target_h, bitrate):
+        cmd = [
+            self.ffmpeg_exe, '-y',
+            '-f', 'image2pipe', '-vcodec', 'mjpeg', '-r', str(self.fps),
+            '-i', '-',
+            '-vf', f'scale=-2:{target_h}',
+            '-c:v', codec
+        ]
+
+        if codec == 'h264_nvenc':
+            cmd += [
+                '-rc', 'vbr', '-cq', '28',
+                '-b:v', bitrate, '-maxrate', bitrate,
+                '-preset', 'p1',
+                '-pix_fmt', 'yuv420p',
+            ]
+        elif codec == 'h264_amf':
+            cmd += [
+                '-rc', 'cqp', '-qp_i', '28', '-qp_p', '28',
+                '-b:v', bitrate,
+                '-pix_fmt', 'yuv420p',
+            ]
+        elif codec == 'h264_qsv':
+            cmd += [
+                '-global_quality', '28',
+                '-b:v', bitrate,
+                '-pix_fmt', 'yuv420p',
+            ]
+        elif codec == 'h264_videotoolbox':
+            cmd += [
+                '-q:v', '50',
+                '-b:v', bitrate,
+                '-pix_fmt', 'yuv420p',
+            ]
+        else:  # libx264 CPU fallback
+            cmd += [
+                '-crf', '26', '-preset', 'ultrafast',
+                '-pix_fmt', 'yuv420p', '-b:v', bitrate,
+            ]
+
+        return cmd
 
     def ensure_playwright_installed(self):
         if os.path.exists(BROWSER_STORAGE) and os.listdir(BROWSER_STORAGE):
@@ -100,7 +234,7 @@ class run_video_generation:
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
         except Exception as e:
-            print(f"⚠️ Playwright check/install failed: {e}")
+            self.log(f"⚠️ Playwright check/install failed: {e}")
 
     def generate(self, audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
                  glow_path, output_folder, signature_text, font_name, target_h=720,
@@ -125,7 +259,7 @@ class run_video_generation:
 
     async def _async_generate(self, a1, a2, bg, i1, i2, out_path,
                                signature, font, target_h, bg_frames_folder):
-        print("📊 Analyzing audio channels...")
+        self.log("📊 Analyzing audio channels...")
         s2 = AudioSegment.from_file(a1)
         s1 = AudioSegment.from_file(a2)
         total_f = int((max(len(s1), len(s2)) / 1000.0) * self.fps)
@@ -145,9 +279,9 @@ class run_video_generation:
         # Empty list → static image mode.
         frame_index = _build_frame_index(bg_frames_folder)
         if frame_index:
-            print(f"🎞 Flipbook mode: {len(frame_index)} frames available.")
+            self.log(f"🎞 Flipbook mode: {len(frame_index)} frames available.")
         else:
-            print("🖼 Static background mode.")
+            self.log("🖼 Static background mode.")
 
         paths = {
             'html': resource_path(os.path.join("DefaultImages", "movie.html")),
@@ -170,7 +304,8 @@ class run_video_generation:
         for i, chunk_info in enumerate(all_chunks):
             workers_assignment[i % self.cores].append(chunk_info)
 
-        print(f"🔥 Rendering {total_chunks} chunks on {self.cores} workers...")
+        self.log(f"🔥 Rendering {total_chunks} chunks on {self.cores} workers...")
+        self.log("💓 Heartbeat: worker tasks launched")
 
         tasks = []
         for worker_id in range(self.cores):
@@ -187,12 +322,12 @@ class run_video_generation:
 
         # PERSISTENT RESCUE LOOP
         if not failed_queue.empty():
-            print(f"🔄 {failed_queue.qsize()} chunks were rejected. Rescuing...")
+            self.log(f"🔄 {failed_queue.qsize()} chunks were rejected. Rescuing...")
             while not failed_queue.empty():
                 c_id, c_start, c_end = await failed_queue.get()
                 res = None
                 while not res or not res[1]:
-                    print(f"⚠️ Retrying failed chunk {c_id}...")
+                    self.log(f"⚠️ Retrying failed chunk {c_id}...")
                     res = await self.render_chunk(
                         c_id, c_start, c_end, v1, v2,
                         paths, signature, font, target_h, frame_index
@@ -216,7 +351,7 @@ class run_video_generation:
             for c in valid_chunks:
                 f.write(f"file '{os.path.abspath(c).replace(chr(92), '/')}'\n")
 
-        print("🎬 Concatenating chunks...")
+        self.log("🎬 Concatenating chunks...")
         subprocess.run([
             self.ffmpeg_exe, '-y', '-f', 'concat', '-safe', '0', '-i', parts_file,
             '-i', a1, '-i', a2,
@@ -229,7 +364,7 @@ class run_video_generation:
             if os.path.exists(f):
                 os.remove(f)
 
-        print(f"✅ Video saved to: {out_path}")
+        self.log(f"✅ Video saved to: {out_path}")
         return out_path
 
     async def worker_routine(self, worker_id, assigned_chunks, vol1, vol2,
@@ -238,7 +373,7 @@ class run_video_generation:
         completed_chunks = []
         CHUNK_TIMEOUT = 45
 
-        for chunk_id, start_f, end_f in assigned_chunks:
+        for idx, (chunk_id, start_f, end_f) in enumerate(assigned_chunks, start=1):
             success = False
             attempts = 0
             while not success and attempts < 3:
@@ -254,12 +389,16 @@ class run_video_generation:
                     if res and res[1]:
                         completed_chunks.append(res)
                         success = True
-                except Exception:
+                        self.log(f"💓 Worker {worker_id}: completed chunk {idx}/{len(assigned_chunks)}")
+                except Exception as e:
+                    self.log(f"💔 Worker {worker_id}: chunk {chunk_id} attempt {attempts} failed with error: {e}. retrying...")
                     await asyncio.sleep(2)
 
             if not success:
+                self.log(f"⚠️ Worker {worker_id}: chunk {chunk_id} failed after 3 attempts")
                 await failed_queue.put((chunk_id, start_f, end_f))
 
+        self.log(f"💓 Worker {worker_id} finished; completed {len(completed_chunks)} chunks")
         return completed_chunks
 
     async def render_chunk(self, chunk_id, start_f, end_f, vol1, vol2,
@@ -270,9 +409,8 @@ class run_video_generation:
         range_val = MAX_OUTLINE - MIN_OUTLINE
         bitrate = f"{int((target_h / 1080) * 4000 * 1.15)}k"
 
-        # Flipbook mode when we have pre-extracted frames, static otherwise.
         use_flipbook = len(frame_index) > 0
-        total_frames_available = len(frame_index)  # 0 in static mode
+        total_frames_available = len(frame_index)
 
         try:
             async with async_playwright() as p:
@@ -287,14 +425,10 @@ class run_video_generation:
                 html_url = f"file:///{os.path.abspath(paths['html']).replace(chr(92), '/')}"
                 await context.goto(html_url)
 
-                # Static background path — used in static mode and as the
-                # initial src in flipbook mode (overwritten per-frame below).
                 bg_p = f"file:///{os.path.abspath(paths['bg_img']).replace(chr(92), '/')}"
                 h_p  = f"file:///{os.path.abspath(paths['h_img']).replace(chr(92), '/')}"
                 g_p  = f"file:///{os.path.abspath(paths['g_img']).replace(chr(92), '/')}"
 
-                # Initial page setup — always use the static <img> element;
-                # the video element is never touched.
                 await context.evaluate(f"""() => {{
                     const bgImg = document.querySelector('.background-img');
                     if (bgImg) bgImg.src = '{bg_p}';
@@ -322,64 +456,67 @@ class run_video_generation:
                     }}
                 """)
 
-                cmd = [
-                    self.ffmpeg_exe, '-y',
-                    '-f', 'image2pipe', '-vcodec', 'mjpeg', '-r', str(self.fps),
-                    '-i', '-',
-                    '-vf', f'scale=-2:{target_h}',
-                    '-c:v', self.codec
-                ]
-
-                if "nvenc" in self.codec:
-                    cmd += ['-rc', 'vbr', '-cq', '28', '-b:v', bitrate,
-                            '-maxrate', bitrate, '-preset', 'p1', '-pix_fmt', 'yuv420p']
-                elif "amf" in self.codec:
-                    cmd += ['-b:v', bitrate, '-pix_fmt', 'yuv420p']
-                else:
-                    cmd += ['-crf', '26', '-preset', 'ultrafast',
-                            '-pix_fmt', 'yuv420p', '-b:v', bitrate]
-
-                cmd.append(chunk_name)
+                codec = self.codec
+                self.log(f"🎯 chunk {chunk_id}: encoding with {codec}")
+                cmd = self._build_ffmpeg_cmd(codec, target_h, bitrate) + [chunk_name]
 
                 proc = subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 )
 
-                for i in range(start_f, end_f):
-                    v1_val = float(vol1[i]) if float(vol1[i]) > 0.005 else 0
-                    v2_val = float(vol2[i]) if float(vol2[i]) > 0.005 else 0
+                try:
+                    for i in range(start_f, end_f):
+                        v1_val = float(vol1[i]) if float(vol1[i]) > 0.005 else 0
+                        v2_val = float(vol2[i]) if float(vol2[i]) > 0.005 else 0
 
-                    if use_flipbook:
-                        # Clamp frame index so short videos loop / hold on last frame.
-                        frame_idx = i % total_frames_available
-                        frame_path = frame_index[frame_idx].replace('\\', '/')
-                        frame_url  = f"file:///{frame_path}"
+                        if use_flipbook:
+                            frame_idx = i % total_frames_available
+                            frame_url = f"file:///{frame_index[frame_idx].replace(chr(92), '/')}"
+                            await context.evaluate(f"""() => {{
+                                if (window.speakers[0]) window.speakers[0].style.setProperty('--pulse', {v1_val});
+                                if (window.speakers[1]) window.speakers[1].style.setProperty('--pulse', {v2_val});
+                                if (window.bgImg) window.bgImg.src = '{frame_url}';
+                            }}""")
+                        else:
+                            await context.evaluate(f"""() => {{
+                                if (window.speakers[0]) window.speakers[0].style.setProperty('--pulse', {v1_val});
+                                if (window.speakers[1]) window.speakers[1].style.setProperty('--pulse', {v2_val});
+                            }}""")
 
-                        await context.evaluate(f"""() => {{
-                            if (window.speakers[0]) window.speakers[0].style.setProperty('--pulse', {v1_val});
-                            if (window.speakers[1]) window.speakers[1].style.setProperty('--pulse', {v2_val});
-                            if (window.bgImg) window.bgImg.src = '{frame_url}';
-                        }}""")
-                    else:
-                        # Static image — just update the pulse values.
-                        await context.evaluate(f"""() => {{
-                            if (window.speakers[0]) window.speakers[0].style.setProperty('--pulse', {v1_val});
-                            if (window.speakers[1]) window.speakers[1].style.setProperty('--pulse', {v2_val});
-                        }}""")
+                        frame = await context.screenshot(type='jpeg', quality=85)
+                        proc.stdin.write(frame)
 
-                    frame = await context.screenshot(type='jpeg', quality=85)
-                    proc.stdin.write(frame)
+                    proc.stdin.close()
+                    _, stderr = proc.communicate()
 
-                proc.stdin.close()
-                proc.wait()
+                    if proc.returncode != 0:
+                        err = stderr.decode('utf-8', errors='ignore')[:500]
+                        self.log(f"❌ chunk {chunk_id}: encode failed (rc={proc.returncode}): {err}")
+                        await browser.close()
+                        return chunk_id, None
+
+                    self.log(f"✅ chunk {chunk_id}: encoded successfully")
+
+                except Exception as e:
+                    self.log(f"💥 chunk {chunk_id}: rendering loop error: {e}")
+                    proc.kill()
+                    if os.path.exists(chunk_name):
+                        try:
+                            os.remove(chunk_name)
+                        except Exception as e2:
+                            self.log(f"⚠️ chunk {chunk_id}: cleanup failed: {e2}")
+                    await browser.close()
+                    return chunk_id, None
+
                 await browser.close()
                 return chunk_id, chunk_name
 
-        except Exception:
+        except Exception as exc:
+            self.log(f"❌ chunk {chunk_id}: unexpected exception: {exc}")
             if os.path.exists(chunk_name):
                 try:
                     os.remove(chunk_name)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.log(f"⚠️ chunk {chunk_id}: cleanup failed: {e}")
             return chunk_id, None
