@@ -1,6 +1,10 @@
 # InterviewRecorder
 **Record and analyize interviews and debates!**
 
+# AV1 support is here!
+![av1](https://github.com/user-attachments/assets/829efffd-4acb-480c-a47c-2ae6babfa236)
+
+
 # STUDIO UPDATE IS OUT
 ![pda](https://github.com/user-attachments/assets/e9be2b76-0bce-4ee7-b933-8ef0e9472b79)
 
