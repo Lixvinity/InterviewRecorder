@@ -238,12 +238,15 @@ class run_video_generation:
 
     def generate(self, audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
                  glow_path, output_folder, signature_text, font_name, target_h=720,
-                 bg_frames_folder=None):
+                 bg_frames_folder=None, is_vertical=False):
         """
         bg_frames_folder : str | None
             Path to a folder of pre-extracted JPEG frames (frame_000001.jpg …).
             When provided the background animates through those frames like a
             flipbook.  When None, bg_path is used as a static image.
+        is_vertical : bool
+            Flag from the previous script to indicate if the final video needs
+            to be rotated 90 degrees to the left.
         """
         self.ensure_playwright_installed()
         out_name = f"render_{int(time.time())}.mp4"
@@ -254,11 +257,11 @@ class run_video_generation:
 
         return asyncio.run(self._async_generate(
             audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
-            final_output, signature_text, font_name, target_h, bg_frames_folder
+            final_output, signature_text, font_name, target_h, bg_frames_folder, is_vertical
         ))
 
     async def _async_generate(self, a1, a2, bg, i1, i2, out_path,
-                               signature, font, target_h, bg_frames_folder):
+                               signature, font, target_h, bg_frames_folder, is_vertical):
         self.log("📊 Analyzing audio channels...")
         s2 = AudioSegment.from_file(a1)
         s1 = AudioSegment.from_file(a2)
@@ -352,13 +355,34 @@ class run_video_generation:
                 f.write(f"file '{os.path.abspath(c).replace(chr(92), '/')}'\n")
 
         self.log("🎬 Concatenating chunks...")
-        subprocess.run([
-            self.ffmpeg_exe, '-y', '-f', 'concat', '-safe', '0', '-i', parts_file,
-            '-i', a1, '-i', a2,
-            '-filter_complex', '[1:a][2:a]amix=inputs=2:duration=longest[aout]',
-            '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', out_path
-        ], stderr=subprocess.DEVNULL,
-           creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+
+        if is_vertical:
+            self.log("🔄 Applying 90-degree left rotation for vertical format...")
+            # transpose=2 is the FFmpeg filter for 90 degrees counter-clockwise (left)
+            filter_complex_str = '[1:a][2:a]amix=inputs=2:duration=longest[aout];[0:v]transpose=2[vout]'
+            
+            # Since we are applying a video filter, we cannot copy the stream. 
+            # Re-calculating bitrate to maintain quality via hardware encode burn-in.
+            bitrate = f"{int((target_h / 1080) * 4000 * 1.15)}k"
+            
+            cmd = [
+                self.ffmpeg_exe, '-y', '-f', 'concat', '-safe', '0', '-i', parts_file,
+                '-i', a1, '-i', a2,
+                '-filter_complex', filter_complex_str,
+                '-map', '[vout]', '-map', '[aout]',
+                '-c:v', self.codec, '-b:v', bitrate, '-c:a', 'aac', out_path
+            ]
+        else:
+            filter_complex_str = '[1:a][2:a]amix=inputs=2:duration=longest[aout]'
+            cmd = [
+                self.ffmpeg_exe, '-y', '-f', 'concat', '-safe', '0', '-i', parts_file,
+                '-i', a1, '-i', a2,
+                '-filter_complex', filter_complex_str,
+                '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', out_path
+            ]
+
+        subprocess.run(cmd, stderr=subprocess.DEVNULL,
+                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
 
         for f in valid_chunks + [parts_file]:
             if os.path.exists(f):
