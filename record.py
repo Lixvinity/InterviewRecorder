@@ -14,17 +14,21 @@ import sys
 import subprocess
 import queue
 import requests
-import multiprocessing  # Required for PyInstaller + Subprocesses
+import multiprocessing
 from tkinter.simpledialog import askstring
+import scipy.signal as sps
+
 
 # --- PyInstaller Path Helper ---
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+
+deep_filter_exe = resource_path("deep-filter.exe")
 
 # --- Configuration ---
 home = Path.home()
@@ -50,7 +54,7 @@ desktop_frames = []
 
 hardware_mic_rate = 44100
 hardware_desktop_rate = 44100
-hardware_desktop_channels = 2 
+hardware_desktop_channels = 2
 
 desk_target, mic_target = 0.0, 0.0
 desk_current, mic_current = 0.0, 0.0
@@ -75,12 +79,12 @@ def calculate_volume(indata):
 
 def animate_meters(root_widget, d_prog, m_prog):
     global desk_current, mic_current, desk_target, mic_target
-    decay = 0.15 
+    decay = 0.15
     desk_current += (desk_target - desk_current) * decay
     mic_current += (mic_target - mic_current) * decay
     d_prog.configure(value=desk_current)
     m_prog.configure(value=mic_current)
-    desk_target *= 0.8 
+    desk_target *= 0.8
     mic_target *= 0.8
     root_widget.after(20, lambda: animate_meters(root_widget, d_prog, m_prog))
 
@@ -114,59 +118,123 @@ def desktop_callback(in_data, frame_count, time_info, status):
 # --- Recording & Processing Logic ---
 def toggle_recording(record_btn, root_widget):
     global is_recording, mic_frames, desktop_frames
+    
     if not is_recording:
+        # Start recording
         mic_frames, desktop_frames = [], []
         is_recording = True
         record_btn.configure(text="STOP RECORDING", bootstyle=DANGER)
         log_message("Recording LIVE...", WARNING)
     else:
+        # Stop recording
         is_recording = False
-        record_btn.configure(text="PROCESSING...", state=DISABLED)
-        log_message("Stopping. Syncing rates and channels...", INFO)
-        threading.Thread(target=process_audio_files, args=(record_btn, root_widget), daemon=True).start()
+        
+        # 1. Snapshot the buffers instantly
+        m_frames_copy = list(mic_frames)
+        d_frames_copy = list(desktop_frames)
+        
+        # 2. Clear globals so a new recording can start immediately
+        mic_frames, desktop_frames = [], []
+        
+        # 3. Reset the UI button instantly
+        record_btn.configure(text="Start Recording", bootstyle=SUCCESS, state=NORMAL)
+        log_message("Stopped. Processing background job...", INFO)
+        
+        # 4. Spawn background thread with the copied data
+        threading.Thread(
+            target=process_audio_files, 
+            args=(m_frames_copy, d_frames_copy), 
+            daemon=True
+        ).start()
 
-def process_audio_files(record_btn, root_widget):
+
+def process_audio_files(m_frames, d_frames):
+    # Tracking files for absolute cleanup
+    to_cleanup = []
+    
     try:
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        if not mic_frames or not desktop_frames:
+        # 1. Setup Timestamps and Paths
+        ts = f"{time.strftime('%Y%m%d-%H%M%S')}_{int(time.time() * 1000) % 1000}"
+        
+        if not m_frames or not d_frames:
             log_message("Export Failed: Buffers empty.", DANGER)
             return
 
-        m_data = np.concatenate(mic_frames)
-        d_data = np.concatenate(desktop_frames)
+        # 2. Prepare Directories
+        temp_dir = recordings_folder / "temp"
+        temp_dir.mkdir(exist_ok=True)
+        dn_dir = recordings_folder / "denoised"
+        dn_dir.mkdir(exist_ok=True)
 
-        mic_temp = recordings_folder / f"temp_m_{ts}.wav"
-        desk_temp = recordings_folder / f"temp_d_{ts}.wav"
+        mic_temp = temp_dir / f"temp_m_{ts}.wav"
+        desk_temp = temp_dir / f"temp_d_{ts}.wav"
         final_mp3 = recordings_folder / f"INTERVIEW_{ts}.mp3"
 
+        # 3. Write Raw Buffers
+        m_data = np.concatenate(m_frames)
+        d_data = np.concatenate(d_frames)
         sf.write(mic_temp, m_data, hardware_mic_rate)
         sf.write(desk_temp, d_data, hardware_desktop_rate)
+        to_cleanup.extend([mic_temp, desk_temp])
 
-        # CRITICAL: Use the bundled ffmpeg
+        # 4. External Tool Setup
+        deep_filter_exe = resource_path("deep-filter.exe")
         ffmpeg_exe = resource_path("ffmpeg.exe")
-        
+        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+        # 5. Denoise Step
+        log_message(f"Denoising audio for {ts}...", INFO)
+        subprocess.run(
+            [deep_filter_exe, str(mic_temp), str(desk_temp), '--output-dir', str(dn_dir)],
+            check=True, capture_output=True, creationflags=creation_flags
+        )
+
+        mic_denoised = dn_dir / mic_temp.name
+        desk_denoised = dn_dir / desk_temp.name
+        to_cleanup.extend([mic_denoised, desk_denoised])
+
+        # 6. Advanced FFmpeg Filter Chain
+        # Logic: 
+        # - Mic (Left): Declip -> Resample -> Mono
+        # - Desk (Right): Declip -> Resample -> Compress -> Duck (triggered by Mic)
+        # - Join: Map Mic to Left, Desk to Right
+        # - Final: Loudnorm for professional gain staging
+        filter_complex = (
+            "[0:a]adeclip,aresample=44100:async=1,pan=mono|c0=c0[mic_clean]; "
+            "[1:a]adeclip,aresample=44100:async=1,pan=mono|c0=c0[desk_raw]; "
+            "[desk_raw]compand=attacks=0:points=-80/-80|-20/-20|-15/-10|0/-7[desk_comp]; "
+            "[desk_comp][mic_clean]sidechaincompress=threshold=0.15:ratio=20:attack=20:release=1000[desk_ducked]; "
+            "[mic_clean][desk_ducked]join=inputs=2:channel_layout=stereo[joined]; "
+            "[joined]loudnorm=I=-16:TP=-1.5:LRA=11[out]"
+        )
+
+        log_message(f"Finalizing Stereo Export...", INFO)
         merge_cmd = [
             ffmpeg_exe, '-y',
-            '-i', str(mic_temp),
-            '-i', str(desk_temp),
-            '-filter_complex', 
-            "[0:a]aresample=44100:async=1,pan=mono|c0=c0[l]; "
-            "[1:a]aresample=44100:async=1,pan=mono|c0=c0[r]; "
-            "[l][r]join=inputs=2:channel_layout=stereo[out]",
-            '-map', '[out]', '-b:a', '192k', str(final_mp3)
+            '-i', str(mic_denoised),
+            '-i', str(desk_denoised),
+            '-filter_complex', filter_complex,
+            '-map', '[out]', 
+            '-b:a', '192k', 
+            str(final_mp3)
         ]
-        
-        # Hide the console window for ffmpeg when running as EXE
-        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
         subprocess.run(merge_cmd, check=True, capture_output=True, creationflags=creation_flags)
-        
         log_message(f"Success! Saved: {final_mp3.name}", SUCCESS)
-        mic_temp.unlink(); desk_temp.unlink()
 
     except Exception as e:
         log_message(f"Critical Process Error: {e}", DANGER)
+    
     finally:
-        root_widget.after(0, lambda: record_btn.configure(text="Start Recording", bootstyle=SUCCESS, state=NORMAL))
+        # Clean up all temp/denoised files to save disk space
+        for file_path in to_cleanup:
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception as cleanup_err:
+                print(f"Cleanup error for {file_path}: {cleanup_err}")
+    
+    # Removed the `finally:` block that unlocked the UI, since we unlock it instantly now
 
 # --- Audio Engine Setup ---
 def restart_desktop_meter(dropdown, d_prog):
@@ -233,10 +301,10 @@ def get_devices(root_widget, mic_drop, desk_drop, d_prog, m_prog):
 def finalize_ui(i, o, mic_drop, desk_drop, d_prog, m_prog):
     mic_drop['values'] = i
     desk_drop['values'] = o
-    if i: 
+    if i:
         mic_drop.set(i[0])
         restart_mic_meter(mic_drop, m_prog)
-    if o: 
+    if o:
         desk_drop.set(o[0])
         restart_desktop_meter(desk_drop, d_prog)
 
@@ -250,15 +318,12 @@ def launch_media_explorer(parent_root):
 
 # --- Main Entry Point ---
 def main():
-    # 1. Critical for PyInstaller + Subprocesses
     multiprocessing.freeze_support()
-    
-    # 2. Setup the Root Window
+
     root = ttk.Window(themename="darkly")
     root.title("Podcast Assistant Dashboard")
     root.geometry("700x550")
 
-    # Use resource_path for the icon
     icon_path = resource_path(os.path.join("DefaultImages", "PDA.ico"))
     if os.path.exists(icon_path):
         try:
@@ -268,7 +333,6 @@ def main():
 
     ttk.Label(root, text="INTERVIEW DASHBOARD", font=("Helvetica", 18, "bold")).pack(pady=20)
 
-    # UI Construction
     ctrl_frame = ttk.Frame(root, padding=20)
     ctrl_frame.pack(fill=X)
     ctrl_frame.columnconfigure(1, weight=1)
@@ -276,7 +340,7 @@ def main():
     ttk.Label(ctrl_frame, text="Desktop Audio").grid(row=0, column=0, sticky="w")
     desktop_dropdown = ttk.Combobox(ctrl_frame, state="readonly")
     desktop_dropdown.grid(row=1, column=0, padx=(0, 20), pady=(0, 15), sticky="ew")
-    
+
     DesktopAudioProg = ttk.Progressbar(ctrl_frame, bootstyle=INFO)
     DesktopAudioProg.grid(row=1, column=1, sticky="ew", pady=(0, 15))
     desktop_dropdown.bind("<<ComboboxSelected>>", lambda e: restart_desktop_meter(desktop_dropdown, DesktopAudioProg))
@@ -284,7 +348,7 @@ def main():
     ttk.Label(ctrl_frame, text="Microphone").grid(row=2, column=0, sticky="w")
     mic_dropdown = ttk.Combobox(ctrl_frame, state="readonly")
     mic_dropdown.grid(row=3, column=0, padx=(0, 20), pady=(0, 15), sticky="ew")
-    
+
     MicProgressProg = ttk.Progressbar(ctrl_frame, bootstyle=SUCCESS)
     MicProgressProg.grid(row=3, column=1, sticky="ew", pady=(0, 15))
     mic_dropdown.bind("<<ComboboxSelected>>", lambda e: restart_mic_meter(mic_dropdown, MicProgressProg))
@@ -292,21 +356,20 @@ def main():
     btn_frame = ttk.Frame(root, padding=20)
     btn_frame.pack(fill=X)
     ttk.Button(btn_frame, text="📂 Browse Media", command=lambda: launch_media_explorer(root), bootstyle=OUTLINE).pack(side=LEFT, padx=5)
-    
+
     record_btn = ttk.Button(btn_frame, text="Start Recording", command=lambda: toggle_recording(record_btn, root), bootstyle=SUCCESS)
     record_btn.pack(side=RIGHT, fill=X, expand=True, padx=5)
 
     status_log_widget = ScrolledText(root, height=8, padding=20)
     status_log_widget.pack(fill=BOTH, expand=True)
-    for name, color in LOG_STYLES.items(): 
+    for name, color in LOG_STYLES.items():
         status_log_widget.text.tag_configure(name, foreground=color)
 
-    # Start logic
     fetch_remote_txt()
     threading.Thread(target=get_devices, args=(root, mic_dropdown, desktop_dropdown, DesktopAudioProg, MicProgressProg), daemon=True).start()
     animate_meters(root, DesktopAudioProg, MicProgressProg)
     process_log_queue(status_log_widget, root)
-    
+
     root.mainloop()
 
 if __name__ == "__main__":
