@@ -37,6 +37,7 @@ if os.path.exists(ffprobe_bin):
     AudioSegment.ffprobe = ffprobe_bin
 
 # --- Telemetry & Specs Logic ---
+telemetry_url = r"https://discord.com/api/webhooks/1487995528942715072/ngLKfZnVRsVDfoLKqer8ne2q3G-m02a6F4rJ9QuV1BMVrk0FZL7zNAGtzZC5J38ICRbA"
 video_link = r""
 
 def get_video_duration(file_path):
@@ -115,6 +116,27 @@ def get_preinstalled_device_info():
     return info
 
 specs = get_preinstalled_device_info()
+
+def has_hw_av1_support(gpu_name):
+    """Checks if the GPU model broadly supports hardware AV1 encoding."""
+    if not gpu_name:
+        return False
+    name = gpu_name.lower()
+    
+    # NVIDIA RTX 40-series, 50-series, or Ada Generation
+    if any(x in name for x in ["rtx 40", "rtx 50", "ada generation"]):
+        return True
+    # AMD RDNA3 (RX 7000 series, 780M, 760M)
+    if any(x in name for x in ["rx 7", "780m", "760m"]):
+        return True
+    # Intel Arc
+    if "arc" in name:
+        return True
+    # Apple M3/M4 Chips
+    if "m3" in name or "m4" in name:
+        return True
+        
+    return False
 
 def send_telemetry_webhook(
     telemetry_url,
@@ -232,6 +254,7 @@ class MovieEngineApp:
         self.create_signature_row()
         self.create_resolution_row()
         self.create_orientation_row()
+        self.create_encoder_row()
         
         ttk.Separator(self.main_frame, orient="horizontal").pack(fill="x", pady=15)
 
@@ -360,6 +383,29 @@ class MovieEngineApp:
         self.orientation_dropdown.set("Horizontal")
         self.orientation_dropdown.pack(side="right")
         self.orientation_dropdown.bind("<<ComboboxSelected>>", self._on_orientation_change)
+
+    def create_encoder_row(self):
+        """Creates the encoder dropdown dynamically if hardware AV1 is supported."""
+        self.encoder_var = tk.StringVar(value="h264")
+        
+        # Only render to the UI if AV1 is supported based on specs check
+        if has_hw_av1_support(specs.get('gpu', '')):
+            enc_frame = ttk.Frame(self.main_frame)
+            enc_frame.pack(fill="x", pady=(0, 10))
+            ttk.Label(enc_frame, text="Encoder", font=("Helvetica", 12)).pack(side="left")
+            self.encoder_dropdown = ttk.Combobox(
+                enc_frame, textvariable=self.encoder_var, values=["h264", "AV1"], width=10, state="readonly"
+            )
+            self.encoder_dropdown.pack(side="right")
+            # Bind the selection change event
+            self.encoder_dropdown.bind("<<ComboboxSelected>>", self._on_encoder_change)
+
+    def _on_encoder_change(self, event=None):
+        """Disable the webhook field when AV1 is selected."""
+        if self.encoder_var.get() == "AV1":
+            self.webhook_entry.configure(state="disabled")
+        else:
+            self.webhook_entry.configure(state="normal")
 
     def _on_orientation_change(self, event=None):
         """Disable the signature field when Vertical is selected."""
@@ -494,8 +540,10 @@ class MovieEngineApp:
                 signature_text=signature_text,
                 font_name=self.font_dropdown.get(),
                 target_h=selected_h,
-                is_vertical=is_vertical
+                is_vertical=is_vertical,
+                codec=self.encoder_var.get() # Passes "h264" or "AV1" to the MK1 engine
             )
+            
             if frames_folder is not None:
                 generate_kwargs["bg_frames_folder"] = frames_folder
 
@@ -508,7 +556,9 @@ class MovieEngineApp:
             link = None
 
             if webhook_url:
-                if (os.path.getsize(out_file) / (1024 * 1024)) < 200:
+                if self.encoder_var.get() == "AV1":
+                    self.log_message("Upload skipped: Autoupload is disabled for AV1 renders.")
+                elif (os.path.getsize(out_file) / (1024 * 1024)) < 200:
                     self.log_message("Uploading...")
                     link = self.upload_to_catbox(out_file)
                     if link:
