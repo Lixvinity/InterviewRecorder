@@ -8,3 +8,6 @@
 - Analyze and archive interviews
 - Render high quality video's the built in
    engine.**
+
+To compile yourself you will need to download
+FFMPEG and store it in the project folder alongside FFPROB and Deep-filternet3
