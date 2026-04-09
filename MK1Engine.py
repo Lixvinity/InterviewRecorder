@@ -33,11 +33,6 @@ os.environ["PATH"] = project_bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 
 def _build_frame_index(frames_folder):
-    """
-    Scans frames_folder for frame_XXXXXX.jpg files and returns them as a
-    sorted list of absolute paths.  Returns an empty list if the folder is
-    None or contains no matching files.
-    """
     if not frames_folder or not os.path.isdir(frames_folder):
         return []
     files = sorted(
@@ -46,19 +41,26 @@ def _build_frame_index(frames_folder):
     return [os.path.join(frames_folder, f) for f in files]
 
 
-# GPU encoder candidates, ordered by preference.
-# Each entry: (codec, vendor_label, platform_guard)
-# platform_guard = None means all platforms; 'darwin' = macOS only, etc.
-_GPU_CANDIDATES = [
+# H.264 GPU encoder candidates, ordered by preference.
+_H264_GPU_CANDIDATES = [
     ("h264_nvenc",        "NVIDIA NVENC",       None),
     ("h264_amf",          "AMD AMF",            None),
     ("h264_qsv",          "Intel QSV",          None),
     ("h264_videotoolbox", "Apple VideoToolbox", "darwin"),
 ]
 
+# AV1 GPU encoder candidates, ordered by preference.
+# These only exist on newer hardware (RTX 40+, RX 7000, Arc, M3/M4).
+_AV1_GPU_CANDIDATES = [
+    ("av1_nvenc",        "NVIDIA NVENC AV1",       None),
+    ("av1_amf",          "AMD AMF AV1",            None),
+    ("av1_qsv",          "Intel QSV AV1",          None),
+    ("av1_videotoolbox", "Apple VideoToolbox AV1", "darwin"),
+]
+
 
 class run_video_generation:
-    def __init__(self, width=1920, height=1080, fps=24, log_callback=None):
+    def __init__(self, width=1920, height=1080, fps=24, log_callback=None, codec=None):
         self.width = width
         self.height = height
         self.fps = fps
@@ -77,97 +79,103 @@ class run_video_generation:
         else:
             self.cores = min(2, total_cores)
 
-        self.codec = self._detect_best_codec()
-
         self.log(f"📊 System RAM: {total_ram_gb:.2f} GB")
         self.log(f"🛠 Hardware Profile: Using {self.cores}/{total_cores} cores")
-        self.log(f"🚀 Encoder Selected: {self.codec}")
 
-    def _detect_best_codec(self):
-        """
-        1. Query ffmpeg for available encoders.
-        2. Walk GPU candidates in priority order, skipping those gated to
-           another platform.
-        3. Validate each listed candidate with a real 1-frame test encode.
-        4. Return the first that passes, or fall back to libx264.
-        """
+        # Store any manually requested codec family ("h264" or "AV1").
+        # Actual encoder resolution happens in generate() so the codec
+        # override from the UI dropdown is respected cleanly.
+        self._requested_codec_family = codec  # "h264", "AV1", or None
+
+        if codec:
+            self.log(f"🎯 Codec family requested: {codec} (will resolve encoder in generate)")
+            self.codec = None  # resolved later
+        else:
+            self.codec = self._detect_best_codec(_H264_GPU_CANDIDATES, "libx264")
+            self.log(f"🚀 Encoder Selected: {self.codec}")
+
+    # ------------------------------------------------------------------
+    # Codec detection helpers
+    # ------------------------------------------------------------------
+
+    def _query_available_encoders(self):
+        """Returns the raw ffmpeg -encoders output string."""
         try:
             result = subprocess.run(
                 [self.ffmpeg_exe, "-encoders"],
                 capture_output=True, text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            available = result.stdout + result.stderr
+            return result.stdout + result.stderr
         except Exception as e:
             self.log(f"⚠️ Could not query FFmpeg encoders: {e}")
-            available = ""
+            return ""
 
-        # Log which GPU codecs are actually listed in this ffmpeg build
-        found_in_binary = [c for c, _, _ in _GPU_CANDIDATES if c in available]
+    def _detect_best_codec(self, candidates, cpu_fallback):
+        """
+        Walk *candidates* in priority order and return the first encoder
+        that is both listed in the ffmpeg binary and passes a smoke test.
+        Falls back to *cpu_fallback* if none pass.
+        """
+        available = self._query_available_encoders()
+        current_platform = platform.system().lower()
+
+        found_in_binary = [c for c, _, _ in candidates if c in available]
         if found_in_binary:
             self.log(f"🔎 GPU codecs present in ffmpeg binary: {', '.join(found_in_binary)}")
         else:
-            self.log("🔎 No GPU codecs found in ffmpeg binary — binary may lack hardware encoder support")
+            self.log("🔎 No matching GPU codecs found in ffmpeg binary")
 
-        current_platform = platform.system().lower()  # 'windows', 'linux', 'darwin'
-
-        for codec, label, platform_guard in _GPU_CANDIDATES:
-            # Skip encoders that only work on a specific OS
+        for codec, label, platform_guard in candidates:
             if platform_guard and current_platform != platform_guard:
                 continue
-
             if codec not in available:
                 self.log(f"⏭ {label} ({codec}): not in ffmpeg binary — skipping")
                 continue
-
-            self.log(f"🔍 Found {label} encoder ({codec}) — validating…")
+            self.log(f"🔍 Found {label} ({codec}) — validating…")
             ok, reason = self._test_encoder(codec)
             if ok:
-                self.log(f"✅ {label} hardware encoder confirmed: {codec}")
+                self.log(f"✅ {label} confirmed: {codec}")
                 return codec
             else:
-                self.log(f"⚠️ {label} smoke test FAILED — reason: {reason}")
+                self.log(f"⚠️ {label} smoke test FAILED — {reason}")
 
-        self.log("ℹ️ No working hardware encoder found; using CPU encoder: libx264")
-        return "libx264"
+        self.log(f"ℹ️ No working hardware encoder found; falling back to: {cpu_fallback}")
+        return cpu_fallback
 
     def _test_encoder(self, codec: str):
-        """
-        Validates a codec by encoding a single synthetic frame.
-        Upped resolution to 256x256 to avoid 'Invalid Argument' errors 
-        caused by hardware minimum size constraints.
-        """
+        """Validates a codec by encoding a single synthetic frame."""
         extra = {
             "h264_nvenc":        ["-preset", "p1"],
-            "h264_amf":          [], # AMF is very sensitive to extra params
+            "h264_amf":          [],
             "h264_qsv":          ["-global_quality", "28"],
             "h264_videotoolbox": ["-q:v", "50"],
+            "av1_nvenc":         ["-preset", "p1"],
+            "av1_amf":           [],
+            "av1_qsv":           ["-global_quality", "28"],
+            "av1_videotoolbox":  ["-q:v", "50"],
         }.get(codec, [])
 
         cmd = [
             self.ffmpeg_exe, "-y",
-            "-f", "lavfi", "-i", "color=black:size=256x256:rate=1", # Increased size
+            "-f", "lavfi", "-i", "color=black:size=256x256:rate=1",
             "-frames:v", "1",
             "-c:v", codec,
-            "-pix_fmt", "yuv420p", # Standard format
+            "-pix_fmt", "yuv420p",
         ] + extra + ["-f", "null", "-"]
 
         try:
             result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=10,
+                cmd, capture_output=True, timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             if result.returncode == 0:
                 return True, None
-            
             stderr_lines = [
                 l.strip() for l in
                 result.stderr.decode("utf-8", errors="ignore").splitlines()
                 if l.strip()
             ]
-            # Capture more lines for better debugging
             reason = " | ".join(stderr_lines[-3:]) if stderr_lines else f"exit code {result.returncode}"
             return False, reason
         except subprocess.TimeoutExpired:
@@ -176,7 +184,11 @@ class run_video_generation:
             return False, str(e)
 
     def _codec_is_gpu(self, codec):
-        return codec in ("h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox")
+        return codec not in ("libx264", "libsvtav1", "libaom-av1")
+
+    # ------------------------------------------------------------------
+    # FFmpeg command builder — now covers AV1 encoders
+    # ------------------------------------------------------------------
 
     def _build_ffmpeg_cmd(self, codec, target_h, bitrate):
         cmd = [
@@ -188,37 +200,46 @@ class run_video_generation:
         ]
 
         if codec == 'h264_nvenc':
-            cmd += [
-                '-rc', 'vbr', '-cq', '28',
-                '-b:v', bitrate, '-maxrate', bitrate,
-                '-preset', 'p1',
-                '-pix_fmt', 'yuv420p',
-            ]
+            cmd += ['-rc', 'vbr', '-cq', '28', '-b:v', bitrate, '-maxrate', bitrate,
+                    '-preset', 'p1', '-pix_fmt', 'yuv420p']
         elif codec == 'h264_amf':
-            cmd += [
-                '-rc', 'cqp', '-qp_i', '28', '-qp_p', '28',
-                '-b:v', bitrate,
-                '-pix_fmt', 'yuv420p',
-            ]
+            cmd += ['-rc', 'cqp', '-qp_i', '28', '-qp_p', '28',
+                    '-b:v', bitrate, '-pix_fmt', 'yuv420p']
         elif codec == 'h264_qsv':
-            cmd += [
-                '-global_quality', '28',
-                '-b:v', bitrate,
-                '-pix_fmt', 'yuv420p',
-            ]
+            cmd += ['-global_quality', '28', '-b:v', bitrate, '-pix_fmt', 'yuv420p']
         elif codec == 'h264_videotoolbox':
-            cmd += [
-                '-q:v', '50',
-                '-b:v', bitrate,
-                '-pix_fmt', 'yuv420p',
-            ]
-        else:  # libx264 CPU fallback
-            cmd += [
-                '-crf', '26', '-preset', 'ultrafast',
-                '-pix_fmt', 'yuv420p', '-b:v', bitrate,
-            ]
+            cmd += ['-q:v', '50', '-b:v', bitrate, '-pix_fmt', 'yuv420p']
+
+        # --- AV1 hardware encoders ---
+        elif codec == 'av1_nvenc':
+            # AV1 NVENC uses the same preset/cq flags as h264_nvenc.
+            # yuv420p10le gives better quality; fall back to yuv420p if driver rejects it.
+            cmd += ['-rc', 'vbr', '-cq', '30', '-b:v', bitrate, '-maxrate', bitrate,
+                    '-preset', 'p1', '-pix_fmt', 'yuv420p']
+        elif codec == 'av1_amf':
+            cmd += ['-rc', 'cqp', '-qp_i', '30', '-qp_p', '30',
+                    '-b:v', bitrate, '-pix_fmt', 'yuv420p']
+        elif codec == 'av1_qsv':
+            cmd += ['-global_quality', '30', '-b:v', bitrate, '-pix_fmt', 'yuv420p']
+        elif codec == 'av1_videotoolbox':
+            cmd += ['-q:v', '50', '-b:v', bitrate, '-pix_fmt', 'yuv420p']
+
+        # --- CPU fallbacks ---
+        elif codec == 'libsvtav1':
+            # SVT-AV1 is fast and high-quality; preferred CPU AV1 encoder.
+            cmd += ['-preset', '8', '-crf', '30', '-b:v', '0',
+                    '-pix_fmt', 'yuv420p']
+        elif codec == 'libaom-av1':
+            # libaom is slow but universally available as a last resort.
+            cmd += ['-cpu-used', '8', '-crf', '30', '-b:v', '0',
+                    '-pix_fmt', 'yuv420p']
+        else:  # libx264 / unknown
+            cmd += ['-crf', '26', '-preset', 'ultrafast',
+                    '-pix_fmt', 'yuv420p', '-b:v', bitrate]
 
         return cmd
+
+    # ------------------------------------------------------------------
 
     def ensure_playwright_installed(self):
         if os.path.exists(BROWSER_STORAGE) and os.listdir(BROWSER_STORAGE):
@@ -238,16 +259,32 @@ class run_video_generation:
 
     def generate(self, audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
                  glow_path, output_folder, signature_text, font_name, target_h=720,
-                 bg_frames_folder=None, is_vertical=False):
+                 bg_frames_folder=None, is_vertical=False, codec=None):
         """
-        bg_frames_folder : str | None
-            Path to a folder of pre-extracted JPEG frames (frame_000001.jpg …).
-            When provided the background animates through those frames like a
-            flipbook.  When None, bg_path is used as a static image.
-        is_vertical : bool
-            Flag from the previous script to indicate if the final video needs
-            to be rotated 90 degrees to the left.
+        codec : str | None
+            Codec *family* string from the UI: "h264" or "AV1".
+            When provided it overrides whatever was passed to __init__.
+            The method resolves the family to an actual encoder via hardware
+            detection and smoke-tests before generating.
         """
+        # --- Resolve the codec to an actual encoder ---
+        # Priority: argument to generate() > value from __init__ > default h264 detection
+        codec_family = codec or self._requested_codec_family
+
+        if codec_family and codec_family.upper() == "AV1":
+            self.log("🎬 AV1 encoding requested — detecting best AV1 encoder…")
+            # Prefer hardware AV1; fall back through CPU options.
+            self.codec = self._detect_best_codec(
+                _AV1_GPU_CANDIDATES,
+                cpu_fallback=self._best_cpu_av1_encoder()
+            )
+            self.log(f"🚀 AV1 Encoder Resolved: {self.codec}")
+        elif self.codec is None:
+            # Codec family is h264 (or unspecified) and __init__ didn't resolve yet.
+            self.codec = self._detect_best_codec(_H264_GPU_CANDIDATES, "libx264")
+            self.log(f"🚀 H.264 Encoder Resolved: {self.codec}")
+        # else: self.codec was already set by __init__ and no override requested.
+
         self.ensure_playwright_installed()
         out_name = f"render_{int(time.time())}.mp4"
         final_output = os.path.join(output_folder, out_name)
@@ -259,6 +296,16 @@ class run_video_generation:
             audio1_path, audio2_path, bg_path, icon1_path, icon2_path,
             final_output, signature_text, font_name, target_h, bg_frames_folder, is_vertical
         ))
+
+    def _best_cpu_av1_encoder(self):
+        """Returns the best available CPU AV1 encoder, or raises if none found."""
+        available = self._query_available_encoders()
+        for enc in ("libsvtav1", "libaom-av1"):
+            if enc in available:
+                self.log(f"ℹ️ CPU AV1 fallback: {enc}")
+                return enc
+        self.log("⚠️ No CPU AV1 encoder found in ffmpeg binary! Falling back to libx264.")
+        return "libx264"
 
     async def _async_generate(self, a1, a2, bg, i1, i2, out_path,
                                signature, font, target_h, bg_frames_folder, is_vertical):
@@ -278,8 +325,6 @@ class run_video_generation:
 
         v1, v2 = get_v(s1), get_v(s2)
 
-        # Build the sorted frame list once and share it with every worker.
-        # Empty list → static image mode.
         frame_index = _build_frame_index(bg_frames_folder)
         if frame_index:
             self.log(f"🎞 Flipbook mode: {len(frame_index)} frames available.")
@@ -323,7 +368,6 @@ class run_video_generation:
         for res_list in worker_results:
             chunks_data.extend(res_list)
 
-        # PERSISTENT RESCUE LOOP
         if not failed_queue.empty():
             self.log(f"🔄 {failed_queue.qsize()} chunks were rejected. Rescuing...")
             while not failed_queue.empty():
@@ -339,11 +383,9 @@ class run_video_generation:
                         await asyncio.sleep(2)
                 chunks_data.append(res)
 
-        # SORTING BY ID TO PREVENT DESYNC
         chunks_data.sort(key=lambda x: x[0])
         valid_chunks = [c[1] for c in chunks_data if c is not None and c[1] is not None]
 
-        # VALIDATION
         if len(valid_chunks) != total_chunks:
             raise RuntimeError(
                 f"❌ Desync Prevention: Expected {total_chunks} chunks, got {len(valid_chunks)}."
@@ -356,20 +398,27 @@ class run_video_generation:
 
         self.log("🎬 Concatenating chunks...")
 
-        if is_vertical:
-            self.log("🔄 Applying 90-degree left rotation for vertical format...")
-            # transpose=2 is the FFmpeg filter for 90 degrees counter-clockwise (left)
-            filter_complex_str = '[1:a][2:a]amix=inputs=2:duration=longest[aout];[0:v]transpose=2[vout]'
-            
-            # Since we are applying a video filter, we cannot copy the stream. 
-            # Re-calculating bitrate to maintain quality via hardware encode burn-in.
+        # AV1 chunks cannot be stream-copied (no copy support for AV1 concat in
+        # most ffmpeg builds), so we always re-encode during the final concat
+        # when AV1 is active — same path as the vertical rotation branch.
+        is_av1 = self.codec.startswith("av1_") or self.codec in ("libsvtav1", "libaom-av1")
+        needs_reencode = is_vertical or is_av1
+
+        if needs_reencode:
+            if is_vertical:
+                self.log("🔄 Applying 90-degree left rotation for vertical format...")
+                filter_complex_str = '[1:a][2:a]amix=inputs=2:duration=longest[aout];[0:v]transpose=2[vout]'
+                map_v = '[vout]'
+            else:
+                filter_complex_str = '[1:a][2:a]amix=inputs=2:duration=longest[aout];[0:v]copy[vout]'
+                map_v = '[vout]'
+
             bitrate = f"{int((target_h / 1080) * 4000 * 1.15)}k"
-            
             cmd = [
                 self.ffmpeg_exe, '-y', '-f', 'concat', '-safe', '0', '-i', parts_file,
                 '-i', a1, '-i', a2,
                 '-filter_complex', filter_complex_str,
-                '-map', '[vout]', '-map', '[aout]',
+                '-map', map_v, '-map', '[aout]',
                 '-c:v', self.codec, '-b:v', bitrate, '-c:a', 'aac', out_path
             ]
         else:
@@ -415,7 +464,7 @@ class run_video_generation:
                         success = True
                         self.log(f"💓 Worker {worker_id}: completed chunk {idx}/{len(assigned_chunks)}")
                 except Exception as e:
-                    self.log(f"💔 Worker {worker_id}: chunk {chunk_id} attempt {attempts} failed with error: {e}. retrying...")
+                    self.log(f"💔 Worker {worker_id}: chunk {chunk_id} attempt {attempts} failed: {e}. retrying...")
                     await asyncio.sleep(2)
 
             if not success:
