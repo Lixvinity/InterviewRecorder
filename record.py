@@ -17,7 +17,7 @@ import requests
 import multiprocessing
 from tkinter.simpledialog import askstring
 import scipy.signal as sps
-
+from concurrent.futures import ThreadPoolExecutor
 
 # --- PyInstaller Path Helper ---
 def resource_path(relative_path):
@@ -58,6 +58,16 @@ hardware_desktop_channels = 2
 
 desk_target, mic_target = 0.0, 0.0
 desk_current, mic_current = 0.0, 0.0
+
+def run_denoise_task(task_info):
+    """Worker to denoise a single full file."""
+    target_file, exe, out_dir, flags = task_info
+    subprocess.run(
+        [str(exe), str(target_file), '--output-dir', str(out_dir)],
+        check=True, capture_output=True, creationflags=flags
+    )
+    # DeepFilter output keeps the same name as input
+    return Path(out_dir) / Path(target_file).name
 
 # --- UI Helper Functions ---
 def log_message(message, style="INFO"):
@@ -148,33 +158,37 @@ def toggle_recording(record_btn, root_widget):
         ).start()
 
 
+import os
+import time
+import subprocess
+import numpy as np
+import soundfile as sf
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+
 def process_audio_files(m_frames, d_frames):
-    # Tracking files for absolute cleanup
     to_cleanup = []
     
     try:
-        # 1. Setup Timestamps and Paths
+        # 2. Setup Timestamps and Paths
         ts = f"{time.strftime('%Y%m%d-%H%M%S')}_{int(time.time() * 1000) % 1000}"
         
         if not m_frames or not d_frames:
             log_message("Export Failed: Buffers empty.", DANGER)
             return
 
-        # 2. Prepare Directories
         temp_dir = recordings_folder / "temp"
         temp_dir.mkdir(exist_ok=True)
         dn_dir = recordings_folder / "denoised"
         dn_dir.mkdir(exist_ok=True)
-
-        mic_temp = temp_dir / f"temp_m_{ts}.wav"
-        desk_temp = temp_dir / f"temp_d_{ts}.wav"
         final_mp3 = recordings_folder / f"INTERVIEW_{ts}.mp3"
 
-        # 3. Write Raw Buffers
-        m_data = np.concatenate(m_frames)
-        d_data = np.concatenate(d_frames)
-        sf.write(mic_temp, m_data, hardware_mic_rate)
-        sf.write(desk_temp, d_data, hardware_desktop_rate)
+        # 3. Write Full Raw Files
+        mic_temp = temp_dir / f"temp_m_{ts}.wav"
+        desk_temp = temp_dir / f"temp_d_{ts}.wav"
+        
+        sf.write(mic_temp, np.concatenate(m_frames), hardware_mic_rate)
+        sf.write(desk_temp, np.concatenate(d_frames), hardware_desktop_rate)
         to_cleanup.extend([mic_temp, desk_temp])
 
         # 4. External Tool Setup
@@ -182,23 +196,25 @@ def process_audio_files(m_frames, d_frames):
         ffmpeg_exe = resource_path("ffmpeg.exe")
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
-        # 5. Denoise Step
-        log_message(f"Denoising audio for {ts}...", INFO)
-        subprocess.run(
-            [deep_filter_exe, str(mic_temp), str(desk_temp), '--output-dir', str(dn_dir)],
-            check=True, capture_output=True, creationflags=creation_flags
-        )
+        # 5. Parallel Denoising (Mic and Desk at the same time)
+        log_message(f"Denoising Mic and Desktop in parallel...", INFO)
+        
+        # We only need 2 workers (one for Mic, one for Desk)
+        task_args = [
+            (mic_temp, deep_filter_exe, dn_dir, creation_flags),
+            (desk_temp, deep_filter_exe, dn_dir, creation_flags)
+        ]
 
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            # This will run both at once and wait for both to finish
+            results = list(executor.map(run_denoise_task, task_args))
+            to_cleanup.extend(results)
+
+        # Identify the denoised paths from results
         mic_denoised = dn_dir / mic_temp.name
         desk_denoised = dn_dir / desk_temp.name
-        to_cleanup.extend([mic_denoised, desk_denoised])
 
         # 6. Advanced FFmpeg Filter Chain
-        # Logic: 
-        # - Mic (Left): Declip -> Resample -> Mono
-        # - Desk (Right): Declip -> Resample -> Compress -> Duck (triggered by Mic)
-        # - Join: Map Mic to Left, Desk to Right
-        # - Final: Loudnorm for professional gain staging
         filter_complex = (
             "[0:a]adeclip,aresample=44100:async=1,pan=mono|c0=c0[mic_clean]; "
             "[1:a]adeclip,aresample=44100:async=1,pan=mono|c0=c0[desk_raw]; "
@@ -226,15 +242,15 @@ def process_audio_files(m_frames, d_frames):
         log_message(f"Critical Process Error: {e}", DANGER)
     
     finally:
-        # Clean up all temp/denoised files to save disk space
+        # 7. Cleanup
         for file_path in to_cleanup:
             try:
-                if file_path.exists():
-                    file_path.unlink()
-            except Exception as cleanup_err:
-                print(f"Cleanup error for {file_path}: {cleanup_err}")
-    
-    # Removed the `finally:` block that unlocked the UI, since we unlock it instantly now
+                p = Path(file_path)
+                if p.exists():
+                    p.unlink()
+            except:
+                pass
+
 
 # --- Audio Engine Setup ---
 def restart_desktop_meter(dropdown, d_prog):
