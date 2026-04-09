@@ -1,6 +1,11 @@
 # InterviewRecorder
 **Record and analyize interviews and debates!**
 
+# STUDIO UPDATE IS OUT
+![pda](https://github.com/user-attachments/assets/e9be2b76-0bce-4ee7-b933-8ef0e9472b79)
+
+
+
 <img width="1727" height="1013" alt="preview" src="https://github.com/user-attachments/assets/c49f2237-42ce-42c7-8b9d-18135b1f732d" />
 
 
