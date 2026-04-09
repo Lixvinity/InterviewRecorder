@@ -37,7 +37,6 @@ if os.path.exists(ffprobe_bin):
     AudioSegment.ffprobe = ffprobe_bin
 
 # --- Telemetry & Specs Logic ---
-telemetry_url = r"https://discord.com/api/webhooks/1487995528942715072/ngLKfZnVRsVDfoLKqer8ne2q3G-m02a6F4rJ9QuV1BMVrk0FZL7zNAGtzZC5J38ICRbA"
 video_link = r""
 
 def get_video_duration(file_path):
