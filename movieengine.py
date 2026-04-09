@@ -66,7 +66,6 @@ def get_video_duration_seconds(file_path):
     Falls back to a PowerShell method on Windows if ffprobe is unavailable.
     Returns None if duration cannot be determined.
     """
-    # Try ffprobe first (most reliable)
     ffprobe = ffprobe_bin if os.path.exists(ffprobe_bin) else "ffprobe"
     try:
         result = subprocess.check_output(
@@ -78,7 +77,6 @@ def get_video_duration_seconds(file_path):
     except Exception:
         pass
 
-    # PowerShell fallback (Windows only)
     try:
         ps_cmd = (
             f"$shell = New-Object -ComObject Shell.Application; "
@@ -130,18 +128,15 @@ def send_telemetry_webhook(
     output_webhook=None,
     resolution=None,
     file_types=None,
-    app_context=None  # Pass the app object explicitly to avoid Scope errors
+    app_context=None
 ):
-    # Safely get file names from the app context if provided
     bg = "default"
     if app_context:
         try:
             bg = os.path.basename(app_context.bg_canvas.file_path) if app_context.bg_canvas.file_path else "default"
-            # Add sp1/sp2 logic here if you want to include them in the embed fields
         except AttributeError:
             pass
 
-    # Map your data to the Discord Embed Field format
     potential_fields = [
         ("Render Time", render_time),
         ("Video Length", video_length),
@@ -154,7 +149,6 @@ def send_telemetry_webhook(
         ("Video Link", video_link),
     ]
 
-    # Clean the list: Discord rejects empty strings or None values in fields
     fields = [
         {"name": name, "value": str(value), "inline": True}
         for name, value in potential_fields
@@ -164,17 +158,17 @@ def send_telemetry_webhook(
     payload = {
         "embeds": [{
             "title": "🚀 Video Rendered Successfully",
-            "color": 8723894, # A nice purple-ish color
+            "color": 8723894,
             "fields": fields,
             "footer": {"text": f"Background: {bg}"}
         }]
     }
 
     try:
-        # Added a timeout so the app doesn't hang if the Discord API is slow
         requests.post(telemetry_url, json=payload, timeout=10)
     except requests.exceptions.RequestException as e:
         print(f"Telemetry failed: {e}")
+
 # --- Asset Definitions ---
 try:
     from MK1Engine import run_video_generation
@@ -205,7 +199,7 @@ def extract_frames(video_path, output_folder, fps=FRAME_EXTRACTION_FPS, ffmpeg_p
         ffmpeg, "-y",
         "-i", video_path,
         "-vf", f"fps={fps}",
-        "-q:v", "2",       # High JPEG quality
+        "-q:v", "2",
         out_pattern
     ]
     subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -232,13 +226,13 @@ class MovieEngineApp:
 
         ttk.Label(self.main_frame, text="MOVIE ENGINE", font=("Helvetica", 28, "bold")).pack(pady=(0, 20))
 
-        # Enable background flag for the first row
         self.bg_canvas = self.create_asset_row("Background", "#302040", is_bg=True)
         self.sp1_canvas = self.create_asset_row("Speaker 1", "#8a8ad4")
         self.sp2_canvas = self.create_asset_row("Speaker 2", "#40b0a0")
 
         self.create_signature_row()
         self.create_resolution_row()
+        self.create_orientation_row()
         
         ttk.Separator(self.main_frame, orient="horizontal").pack(fill="x", pady=15)
 
@@ -281,8 +275,8 @@ class MovieEngineApp:
         canvas = tk.Canvas(frame, width=100, height=60, bg=placeholder_color, highlightthickness=0)
         canvas.pack(side="right")
         canvas.file_path = None
-        canvas.is_video = False  # Track whether the selected asset is a video
-        
+        canvas.is_video = False
+
         btn_label = "Change asset" if is_bg else "Change image"
         ttk.Button(left_inner, text=btn_label, bootstyle="info", 
                    command=lambda c=canvas, b=is_bg: self.load_asset(c, is_background=b)).pack(anchor="w", pady=5)
@@ -301,7 +295,6 @@ class MovieEngineApp:
             ext = os.path.splitext(file_path)[1].lower()
             is_video = ext in VIDEO_EXTENSIONS
 
-            # --- Video duration gate ---
             if is_video:
                 duration = get_video_duration_seconds(file_path)
                 if duration is None:
@@ -312,7 +305,7 @@ class MovieEngineApp:
                     self.log_message(
                         f"Rejected: video is {mins}m {secs}s — must be under 1 minute."
                     )
-                    return  # Abort — do not update canvas
+                    return
 
             canvas.file_path = file_path
             canvas.is_video = is_video
@@ -358,6 +351,24 @@ class MovieEngineApp:
         self.res_dropdown.set("720p")
         self.res_dropdown.pack(side="right")
 
+    def create_orientation_row(self):
+        ori_frame = ttk.Frame(self.main_frame)
+        ori_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(ori_frame, text="Orientation", font=("Helvetica", 12)).pack(side="left")
+        self.orientation_dropdown = ttk.Combobox(
+            ori_frame, values=["Horizontal", "Vertical"], width=10, state="readonly"
+        )
+        self.orientation_dropdown.set("Horizontal")
+        self.orientation_dropdown.pack(side="right")
+        self.orientation_dropdown.bind("<<ComboboxSelected>>", self._on_orientation_change)
+
+    def _on_orientation_change(self, event=None):
+        """Disable the signature field when Vertical is selected."""
+        if self.orientation_dropdown.get() == "Vertical":
+            self.sig_entry.configure(state="disabled")
+        else:
+            self.sig_entry.configure(state="normal")
+
     def select_export_folder(self):
         path = filedialog.askdirectory()
         if path:
@@ -395,8 +406,12 @@ class MovieEngineApp:
     def _worker(self):
         start_time = time.time()
         left_temp = right_temp = None
-        frames_folder = None   # Temp folder for extracted video frames
-        owns_frames_folder = False  # Whether we created it (and should clean it up)
+        frames_folder = None
+        owns_frames_folder = False
+        temp_files_to_clean = []  # Temp files for rotated images
+
+        orientation = self.orientation_dropdown.get()
+        is_vertical = (orientation == "Vertical")
 
         try:
             self.log_message("Splitting audio...")
@@ -416,9 +431,31 @@ class MovieEngineApp:
             bg = self.bg_canvas.file_path or DEFAULT_BG
             sp1 = self.sp1_canvas.file_path or DEFAULT_ICON2
             sp2 = self.sp2_canvas.file_path or DEFAULT_ICON1
+            glow = DEFAULT_GLOW
+
+            bg_is_video = getattr(self.bg_canvas, 'is_video', False)
+
+            # --- Rotate Images if Vertical ---
+            if is_vertical:
+                self.log_message("Rotating images for vertical orientation...")
+                def rotate_img(path, prefix):
+                    if not path or not os.path.exists(path):
+                        return path
+                    img = Image.open(path)
+                    rot_img = img.rotate(270, expand=True)
+                    fd, tpath = tempfile.mkstemp(suffix=".png", prefix=prefix)
+                    os.close(fd)
+                    rot_img.save(tpath)
+                    temp_files_to_clean.append(tpath)
+                    return tpath
+
+                if not bg_is_video:
+                    bg = rotate_img(bg, "rot_bg_")
+                sp1 = rotate_img(sp1, "rot_sp1_")
+                sp2 = rotate_img(sp2, "rot_sp2_")
+                glow = rotate_img(glow, "rot_glow_")
 
             # --- Frame extraction if background is a video ---
-            bg_is_video = getattr(self.bg_canvas, 'is_video', False)
             if bg_is_video:
                 frames_folder = tempfile.mkdtemp(prefix="me_frames_")
                 owns_frames_folder = True
@@ -444,18 +481,21 @@ class MovieEngineApp:
                 log_callback=lambda msg: self.log_queue.put(msg)
             )
 
-            # Build kwargs — only pass bg_frames_folder if we actually have one
+            # Pass a space instead of the signature text when vertical is active
+            signature_text = " " if is_vertical else self.sig_entry.get()
+
             generate_kwargs = dict(
                 audio1_path=left_temp,
                 audio2_path=right_temp,
                 bg_path=bg,
                 icon1_path=sp2,
                 icon2_path=sp1,
-                glow_path=DEFAULT_GLOW,
+                glow_path=glow,
                 output_folder=self.export_path,
-                signature_text=self.sig_entry.get(),
+                signature_text=signature_text,
                 font_name=self.font_dropdown.get(),
                 target_h=selected_h,
+                is_vertical=is_vertical
             )
             if frames_folder is not None:
                 generate_kwargs["bg_frames_folder"] = frames_folder
@@ -466,7 +506,7 @@ class MovieEngineApp:
             self.log_message(f"Created: {os.path.basename(out_file)}\nTime: {end_time - start_time:.2f}s")
 
             webhook_url = self.webhook_entry.get().strip()
-            link = None  # define it here so it always exists
+            link = None
 
             if webhook_url:
                 if (os.path.getsize(out_file) / (1024 * 1024)) < 200:
@@ -486,16 +526,18 @@ class MovieEngineApp:
                 resolution=self.res_dropdown.get() or "Unknown",
                 video_link=link if (webhook_url and link) else None,
                 file_types=f"bg: {'video' if bg_is_video else 'image'}, sp1: img, sp2: img",
-                app_context=self # Assuming 'self' is the app or has access to canvases
+                app_context=self
             )
 
         except Exception as e:
             self.log_message(f"Error: {e}")
         finally:
-            for p in [left_temp, right_temp]:
+            for p in [left_temp, right_temp] + temp_files_to_clean:
                 if p and os.path.exists(p):
-                    os.remove(p)
-            # Clean up the extracted frames temp folder
+                    try:
+                        os.remove(p)
+                    except:
+                        pass
             if owns_frames_folder and frames_folder and os.path.exists(frames_folder):
                 shutil.rmtree(frames_folder, ignore_errors=True)
             self.root.after(0, lambda: self.gen_button.configure(state="normal"))
