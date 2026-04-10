@@ -1,6 +1,9 @@
 # InterviewRecorder
 **Record and analyize interviews and debates!**
 
+<img width="1920" height="1080" alt="pda333" src="https://github.com/user-attachments/assets/f319b39e-b940-45b3-b2ea-ac755c4477d6" />
+
+
 # AV1 support is here!
 ![av1](https://github.com/user-attachments/assets/829efffd-4acb-480c-a47c-2ae6babfa236)
 
