@@ -235,9 +235,16 @@ def process_audio_files(m_frames, d_frames, record_btn=None):
         to_cleanup.extend([raw_mic, raw_desk])
 
         original_mp3 = recordings_folder / f"INTERVIEW_{ts}.mp3"
+        # The mic is mono (1ch) but the desktop is stereo (2ch). ffmpeg's join
+        # filter expects two mono inputs — if given a stereo stream it silently
+        # takes only the FL channel and discards FR, losing half the desktop audio.
+        # Fix: explicitly downmix the stereo desktop to mono (equal L+R blend)
+        # BEFORE joining, so both inputs to join are cleanly mono.
         stereo_cmd = [
             ffmpeg_exe, '-y', '-i', str(raw_mic), '-i', str(raw_desk),
-            '-filter_complex', '[0:a][1:a]join=inputs=2:channel_layout=stereo[out]',
+            '-filter_complex',
+            '[1:a]pan=mono|c0=0.5*FL+0.5*FR[desk_mono];'
+            '[0:a][desk_mono]join=inputs=2:channel_layout=stereo[out]',
             '-map', '[out]', '-b:a', '192k', str(original_mp3)
         ]
         subprocess.run(stereo_cmd, check=True, capture_output=True, creationflags=creation_flags)
